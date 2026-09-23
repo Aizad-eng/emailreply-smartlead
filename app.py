@@ -749,7 +749,28 @@ def slack_actions():
             f"META: {thread_meta}"
         )
 
-        post_slack_chat(channel_id, message_ts, text)
+        if not SLACK_BOT_TOKEN:
+            err = "SLACK_BOT_TOKEN is not set on the server"
+        elif not channel_id or not message_ts:
+            err = f"Slack did not send channel/message ids (channel={channel_id!r} ts={message_ts!r})"
+        else:
+            try:
+                res = post_slack_chat(channel_id, message_ts, text)
+                err = None if res.get("ok") else res.get("error", "unknown_error")
+            except Exception as e:
+                err = str(e)
+
+        if err:
+            print(f"[edit_reply] FAILED to post draft to thread: {err}")
+            if response_url:
+                requests.post(response_url, json={
+                    "replace_original": "false",
+                    "response_type": "ephemeral",
+                    "text": f"\u274c Edit & Send failed: {err}. "
+                            f"Check SLACK_BOT_TOKEN and invite the bot to this channel.",
+                })
+            return "", 200
+
         print(f"[edit_reply] Posted draft to Slack thread for lead={lead_email}. Waiting for user reply.")
         return "", 200
 
