@@ -3,8 +3,13 @@ import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
+import html as html_lib
 import requests
 import anthropic
+try:
+    import emoji as emoji_lib
+except ImportError:  # pragma: no cover
+    emoji_lib = None
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -513,6 +518,60 @@ def fetch_smartlead_thread(campaign_id, lead_id) -> dict:
     }
 
 
+def slack_text_to_html(text: str) -> str:
+    """
+    Convert text typed in Slack (mrkdwn) or a plain Claude draft into email HTML.
+
+    Slack rewrites what people type:  <http://x.com|x.com>, <mailto:a@b|a@b>,
+    <@U123>, &amp;, :smiley:, *bold*, _italic_, ~strike~.  This undoes all of
+    that, escapes anything else, autolinks bare URLs, and turns newlines into <br>.
+    """
+    if not text:
+        return ""
+
+    tokens = []  # placeholders for pieces that are already HTML
+
+    def stash(html_piece: str) -> str:
+        tokens.append(html_piece)
+        return f"\x00{len(tokens) - 1}\x00"
+
+    # <mailto:addr|label> / <mailto:addr>
+    text = re.sub(r"<mailto:([^|>]+)(?:\|([^>]*))?>",
+                  lambda m: stash(f'<a href="mailto:{html_lib.escape(m.group(1))}">{html_lib.escape(m.group(2) or m.group(1))}</a>'),
+                  text)
+    # <url|label> / <url>
+    text = re.sub(r"<(https?://[^|>\s]+)(?:\|([^>]*))?>",
+                  lambda m: stash(f'<a href="{html_lib.escape(m.group(1))}">{html_lib.escape(m.group(2) or m.group(1))}</a>'),
+                  text)
+    # <#C123|channel-name> -> #channel-name ; <@U123> / <!here> -> dropped
+    text = re.sub(r"<#[A-Z0-9]+\|([^>]*)>", r"#\1", text)
+    text = re.sub(r"<[@!][^>]*>", "", text)
+
+    # Slack sends &amp; &lt; &gt; -- unescape to real chars, then escape for HTML
+    text = html_lib.unescape(text)
+    text = html_lib.escape(text, quote=False)
+
+    # Emoji shortcodes -> unicode
+    if emoji_lib is not None:
+        text = emoji_lib.emojize(text, language="alias")
+
+    # Autolink bare URLs the user typed without Slack wrapping them
+    text = re.sub(r"(?<![\"'>\x00])(https?://[^\s<>\"']+)",
+                  lambda m: stash(f'<a href="{m.group(1)}">{m.group(1)}</a>'), text)
+
+    # Basic Slack formatting
+    text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)~([^~\n]+)~(?!\w)", r"<s>\1</s>", text)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+
+    text = text.replace("\r\n", "\n").replace("\n", "<br>")
+
+    # Restore stashed HTML pieces
+    text = re.sub(r"\x00(\d+)\x00", lambda m: tokens[int(m.group(1))], text)
+    return text
+
+
 def send_smartlead_reply(campaign_id, stats_id, reply_message_id: str, body: str,
                          lead_email: str = "", reply_email_time: str = "",
                          reply_email_body: str = "") -> dict:
@@ -522,9 +581,7 @@ def send_smartlead_reply(campaign_id, stats_id, reply_message_id: str, body: str
     Smartlead threads the message itself using reply_message_id, so we only
     send our own HTML body (no manual quoting of the prior thread).
     """
-    # Convert markdown autolinks <https://...> into real anchor tags
-    body = re.sub(r'<(https?://[^>\s]+)>', r'<a href="\1">\1</a>', body)
-    html_body = "<div>" + body.replace("\n", "<br>") + "</div>"
+    html_body = "<div>" + slack_text_to_html(body) + "</div>"
 
     payload = {
         "email_stats_id": stats_id,
