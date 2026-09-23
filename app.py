@@ -110,6 +110,42 @@ Here is the full email thread:
         return reply_snippet
 
 
+def classify_sentiment(lead_response: str, campaign_name: str = "") -> str:
+    """Use Claude to label the lead's reply as Positive, Negative, or Neutral."""
+    if not lead_response or not lead_response.strip():
+        return "Neutral"
+
+    prompt = f"""You are classifying a reply to a cold outreach email from an M&A / home-services campaign.
+
+Campaign: {campaign_name}
+
+Classify the lead's reply into exactly one label:
+- Positive: interested, wants to talk, asks for more info, proposes a time, shares a phone number, open to a conversation
+- Negative: not interested, asks to stop/unsubscribe, hostile, already sold, "remove me", wrong person and no referral
+- Neutral: out-of-office, auto-reply, bounce notice, asks a clarifying question with no clear intent, forwards to someone else
+
+Reply with ONLY one word: Positive, Negative, or Neutral.
+
+Lead's reply:
+{lead_response}"""
+
+    try:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=5,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        label = msg.content[0].text.strip().split()[0].strip(".,").capitalize()
+        if label in ("Positive", "Negative", "Neutral"):
+            print(f"[sentiment] {label}")
+            return label
+        print(f"[sentiment] Unexpected label {label!r}, defaulting to Neutral")
+        return "Neutral"
+    except Exception as e:
+        print(f"[sentiment] Failed: {e}. Defaulting to Neutral.")
+        return "Neutral"
+
+
 def draft_reply(sender_name: str, eaccount: str, lead_email: str,
                 campaign_name: str, reply_text: str) -> str:
     """Use Claude to draft an email reply."""
@@ -271,82 +307,83 @@ def get_calendly_info(email_account: str, campaign_name: str = "") -> dict:
     return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
 
 
-def fetch_available_slots(event_type_uri: str, num_days: int = 3) -> dict:
-    """Fetch available time slots from Calendly, grouped by day."""
-    if not event_type_uri or not CALENDLY_API_KEY:
-        return {}
-
-    now = datetime.now(timezone.utc)
-    start = (now + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end = (now + timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    try:
-        resp = requests.get(
-            "https://api.calendly.com/event_type_available_times",
-            headers={"Authorization": f"Bearer {CALENDLY_API_KEY}"},
-            params={
-                "event_type": event_type_uri,
-                "start_time": start,
-                "end_time": end,
-            },
-        )
-        resp.raise_for_status()
-        all_slots = resp.json().get("collection", [])
-    except Exception as e:
-        print(f"[calendly] Failed to fetch available times: {e}")
-        return {}
-
-    if not all_slots:
-        return {}
-
-    days = {}
-    for slot in all_slots:
-        if slot.get("status") != "available":
-            continue
-        dt = datetime.fromisoformat(slot["start_time"].replace("Z", "+00:00"))
-        et_dt = dt - timedelta(hours=4)
-        day_label = f"{et_dt.strftime('%A')}, {et_dt.strftime('%B')} {et_dt.day}"
-        time_label = et_dt.strftime("%I:%M %p").lstrip("0").lower()
-        if day_label not in days:
-            days[day_label] = []
-        days[day_label].append({
-            "time": time_label,
-            "url": slot["scheduling_url"],
-        })
-
-    sorted_days = dict(list(days.items())[:num_days])
-    total = sum(len(v) for v in sorted_days.values())
-    print(f"[calendly] Fetched {total} slots across {len(sorted_days)} days from {len(all_slots)} total available")
-    return sorted_days
-
-
-def format_slots_for_email(slots_by_day: dict, fallback_url: str) -> str:
-    """Format grouped slots as a text block for email drafts."""
-    if not slots_by_day:
-        return f"Book a time that works for you here: {fallback_url}"
-
-    lines = []
-    for day_label, times in slots_by_day.items():
-        lines.append(f"{day_label}")
-        time_strs = [f"{t['time']} - {t['url']}" for t in times]
-        lines.append("  " + "  |  ".join(time_strs))
-        lines.append("")
-    lines.append(f"Don't see a time that works? Pick any open slot here: {fallback_url}")
-    return "\n".join(lines)
-
-
-def format_slots_for_slack(slots_by_day: dict, fallback_url: str) -> str:
-    """Format grouped slots as a Slack mrkdwn block."""
-    if not slots_by_day:
-        return f"<{fallback_url}|Book a time>"
-
-    lines = []
-    for day_label, times in slots_by_day.items():
-        lines.append(f"*{day_label}*")
-        time_strs = [f"<{t['url']}|{t['time']}>" for t in times]
-        lines.append("  " + "  |  ".join(time_strs))
-    lines.append(f"\n<{fallback_url}|See all available times>")
-    return "\n".join(lines)
+# ---- Calendly available-slots (disabled for now) ----
+# def fetch_available_slots(event_type_uri: str, num_days: int = 3) -> dict:
+#     """Fetch available time slots from Calendly, grouped by day."""
+#     if not event_type_uri or not CALENDLY_API_KEY:
+#         return {}
+#
+#     now = datetime.now(timezone.utc)
+#     start = (now + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+#     end = (now + timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+#
+#     try:
+#         resp = requests.get(
+#             "https://api.calendly.com/event_type_available_times",
+#             headers={"Authorization": f"Bearer {CALENDLY_API_KEY}"},
+#             params={
+#                 "event_type": event_type_uri,
+#                 "start_time": start,
+#                 "end_time": end,
+#             },
+#         )
+#         resp.raise_for_status()
+#         all_slots = resp.json().get("collection", [])
+#     except Exception as e:
+#         print(f"[calendly] Failed to fetch available times: {e}")
+#         return {}
+#
+#     if not all_slots:
+#         return {}
+#
+#     days = {}
+#     for slot in all_slots:
+#         if slot.get("status") != "available":
+#             continue
+#         dt = datetime.fromisoformat(slot["start_time"].replace("Z", "+00:00"))
+#         et_dt = dt - timedelta(hours=4)
+#         day_label = f"{et_dt.strftime('%A')}, {et_dt.strftime('%B')} {et_dt.day}"
+#         time_label = et_dt.strftime("%I:%M %p").lstrip("0").lower()
+#         if day_label not in days:
+#             days[day_label] = []
+#         days[day_label].append({
+#             "time": time_label,
+#             "url": slot["scheduling_url"],
+#         })
+#
+#     sorted_days = dict(list(days.items())[:num_days])
+#     total = sum(len(v) for v in sorted_days.values())
+#     print(f"[calendly] Fetched {total} slots across {len(sorted_days)} days from {len(all_slots)} total available")
+#     return sorted_days
+#
+#
+# def format_slots_for_email(slots_by_day: dict, fallback_url: str) -> str:
+#     """Format grouped slots as a text block for email drafts."""
+#     if not slots_by_day:
+#         return f"Book a time that works for you here: {fallback_url}"
+#
+#     lines = []
+#     for day_label, times in slots_by_day.items():
+#         lines.append(f"{day_label}")
+#         time_strs = [f"{t['time']} - {t['url']}" for t in times]
+#         lines.append("  " + "  |  ".join(time_strs))
+#         lines.append("")
+#     lines.append(f"Don't see a time that works? Pick any open slot here: {fallback_url}")
+#     return "\n".join(lines)
+#
+#
+# def format_slots_for_slack(slots_by_day: dict, fallback_url: str) -> str:
+#     """Format grouped slots as a Slack mrkdwn block."""
+#     if not slots_by_day:
+#         return f"<{fallback_url}|Book a time>"
+#
+#     lines = []
+#     for day_label, times in slots_by_day.items():
+#         lines.append(f"*{day_label}*")
+#         time_strs = [f"<{t['url']}|{t['time']}>" for t in times]
+#         lines.append("  " + "  |  ".join(time_strs))
+#     lines.append(f"\n<{fallback_url}|See all available times>")
+#     return "\n".join(lines)
 
 
 def extract_sender_name(email_account: str) -> str:
@@ -606,16 +643,20 @@ def incoming_reply():
     # upsert_attio_person(lead_email)
     # deal = create_attio_deal(lead_email)
 
-    # Step 4: Calendly slots + Claude draft
-    cal_info = get_calendly_info(eaccount, campaign_name)
-    available_slots = fetch_available_slots(cal_info["event_type"])
-    slack_slots_text = format_slots_for_slack(available_slots, cal_info["fallback_url"])
+    # Step 3b: Sentiment label for the Slack card
+    sentiment = classify_sentiment(lead_response, campaign_name)
+
+    # Step 4: Claude draft
+    # Calendly slot fetching disabled for now:
+    # cal_info = get_calendly_info(eaccount, campaign_name)
+    # available_slots = fetch_available_slots(cal_info["event_type"])
+    # slack_slots_text = format_slots_for_slack(available_slots, cal_info["fallback_url"])
     thread_for_claude = (
         "ORIGINAL OUTBOUND EMAIL (sent by us):\n" + sent_text +
         "\n\n---\n\nPROSPECT'S REPLY:\n" + lead_response
     )
     draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, thread_for_claude)
-    print(f"[draft] Generated {len(draft)} chars for {lead_email} ({len(available_slots)} days of slots fetched)")
+    print(f"[draft] Generated {len(draft)} chars for {lead_email}")
 
     # Step 5: Slack message with action buttons
     base_meta = {
@@ -641,8 +682,10 @@ def incoming_reply():
         meta_edit = json.dumps({**base_meta, "refetch_thread": True})
 
     inbox_link = body.get("ui_master_inbox_link") or body.get("app_url", "")
+    sentiment_icon = {"Positive": "\U0001f7e2", "Negative": "\U0001f534"}.get(sentiment, "\u26aa")
     header = (
         f"\U0001f514 *New Reply*" + (f" ({reply_category})" if reply_category else "") + "\n"
+        f"*Sentiment:* {sentiment_icon} {sentiment}\n"
         f"*Campaign:* {campaign_name}\n"
         f"*Sender:* {eaccount}\n"
         f"*Lead:* {lead_email}"
@@ -655,9 +698,10 @@ def incoming_reply():
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*Lead's Reply:*\n{lead_response}"}},
-        {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text":
-            f"*Available Time Slots:*\n{slack_slots_text}"}},
+        # Available time slots block disabled for now:
+        # {"type": "divider"},
+        # {"type": "section", "text": {"type": "mrkdwn", "text":
+        #     f"*Available Time Slots:*\n{slack_slots_text}"}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*AI Draft:*\n{draft}"}},
