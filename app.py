@@ -14,11 +14,15 @@ app = Flask(__name__)
 
 # --- Config ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")
-ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID")
+# Attio is disabled for now -- see commented-out helpers below.
+# ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")
+# ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY")
+SMARTLEAD_API_KEY = os.getenv("SMARTLEAD_API_KEY")
+# Optional: if set, incoming webhooks must carry a matching "secret_key" field.
+SMARTLEAD_WEBHOOK_SECRET = os.getenv("SMARTLEAD_WEBHOOK_SECRET", "")
+SMARTLEAD_BASE = "https://server.smartlead.ai/api/v1"
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY")
 # Event type URIs from Calendly (found via GET /event_types)
@@ -34,7 +38,7 @@ CALENDLY_STATE17_URL = os.getenv("CALENDLY_STATE17_URL", "https://calendly.com/t
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Track sent replies to prevent Slack event retries from sending duplicates
-_sent_replies = set()  # set of reply_to_uuid values that have already been sent
+_sent_replies = set()  # set of "<stats_id>:<suffix>" keys that have already been sent
 
 
 # ============================================================
@@ -352,47 +356,48 @@ def extract_sender_name(email_account: str) -> str:
     return first.capitalize()
 
 
-def upsert_attio_company(domain: str) -> dict:
-    resp = requests.put(
-        "https://api.attio.com/v2/objects/companies/records",
-        params={"matching_attribute": "domains"},
-        headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
-        json={"data": {"values": {"domains": [{"domain": domain}]}}},
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def upsert_attio_person(lead_email: str) -> dict:
-    resp = requests.put(
-        "https://api.attio.com/v2/objects/people/records",
-        params={"matching_attribute": "email_addresses"},
-        headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
-        json={"data": {"values": {"email_addresses": [{"email_address": lead_email}]}}},
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def create_attio_deal(lead_email: str) -> dict:
-    resp = requests.post(
-        "https://api.attio.com/v2/objects/deals/records",
-        headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "data": {
-                "values": {
-                    "name": [{"value": f"{lead_email} - Interested"}],
-                    "stage": [{"status": "In Progress"}],
-                    "owner": [{
-                        "referenced_actor_type": "workspace-member",
-                        "referenced_actor_id": ATTIO_OWNER_ID,
-                    }],
-                }
-            }
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
+# ---- Attio (disabled for now) ----
+# def upsert_attio_company(domain: str) -> dict:
+#     resp = requests.put(
+#         "https://api.attio.com/v2/objects/companies/records",
+#         params={"matching_attribute": "domains"},
+#         headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
+#         json={"data": {"values": {"domains": [{"domain": domain}]}}},
+#     )
+#     resp.raise_for_status()
+#     return resp.json()
+#
+#
+# def upsert_attio_person(lead_email: str) -> dict:
+#     resp = requests.put(
+#         "https://api.attio.com/v2/objects/people/records",
+#         params={"matching_attribute": "email_addresses"},
+#         headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
+#         json={"data": {"values": {"email_addresses": [{"email_address": lead_email}]}}},
+#     )
+#     resp.raise_for_status()
+#     return resp.json()
+#
+#
+# def create_attio_deal(lead_email: str) -> dict:
+#     resp = requests.post(
+#         "https://api.attio.com/v2/objects/deals/records",
+#         headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
+#         json={
+#             "data": {
+#                 "values": {
+#                     "name": [{"value": f"{lead_email} - Interested"}],
+#                     "stage": [{"status": "In Progress"}],
+#                     "owner": [{
+#                         "referenced_actor_type": "workspace-member",
+#                         "referenced_actor_id": ATTIO_OWNER_ID,
+#                     }],
+#                 }
+#             }
+#         },
+#     )
+#     resp.raise_for_status()
+#     return resp.json()
 
 
 def send_slack_message(blocks: list) -> dict:
@@ -427,208 +432,226 @@ def fetch_slack_thread(channel: str, ts: str) -> dict:
     return resp.json()
 
 
-def fetch_instantly_reply_uuid(campaign_id: str, lead_email: str) -> tuple:
-    """
-    Hit GET /v2/emails with campaign_id and lead.
-    Returns (reply_to_uuid, eaccount, thread_html, wrote_line).
-    """
-    params = {
-        "lead": lead_email,
-        "limit": 10,
-    }
-    if campaign_id:
-        params["campaign_id"] = campaign_id
+def _strip_html(html: str) -> str:
+    """Very light HTML -> text for fallbacks/logging."""
+    if not html:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    text = re.sub(r"</p>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
+
+def fetch_smartlead_thread(campaign_id, lead_id) -> dict:
+    """
+    GET /campaigns/{campaign_id}/leads/{lead_id}/message-history
+    Returns the latest lead REPLY's stats_id/message_id plus the sender account
+    and a combined thread HTML. Used as a fallback when Slack button metadata
+    was too large to carry the thread.
+    """
     resp = requests.get(
-        "https://api.instantly.ai/api/v2/emails",
-        headers={"Authorization": f"Bearer {INSTANTLY_API_KEY}"},
-        params=params,
+        f"{SMARTLEAD_BASE}/campaigns/{campaign_id}/leads/{lead_id}/message-history",
+        params={"api_key": SMARTLEAD_API_KEY},
     )
     resp.raise_for_status()
     data = resp.json()
+    history = data.get("history", []) if isinstance(data, dict) else data
+    if not history:
+        raise ValueError(f"[thread] No message history for campaign={campaign_id} lead={lead_id}")
 
-    emails = data.get("items", data) if isinstance(data, dict) else data
-    if not emails:
-        raise ValueError(
-            f"[fetch_uuid] No emails found for lead={lead_email} campaign={campaign_id}"
-        )
+    replies = [m for m in history if str(m.get("type", "")).upper() == "REPLY"]
+    latest_reply = replies[-1] if replies else history[-1]
+    sent = [m for m in history if str(m.get("type", "")).upper() == "SENT"]
 
-    uuid = emails[0].get("id")
-    eaccount = emails[-1].get("eaccount")
-    from_address = emails[0].get("from_address_email", emails[0].get("eaccount", ""))
-
-    body_obj = emails[0].get("body", {})
-    if isinstance(body_obj, dict):
-        thread_html = body_obj.get("html", "")
-        body_text = body_obj.get("text", "")
-    else:
-        thread_html = str(body_obj) if body_obj else ""
-        body_text = ""
-
-    wrote_line = ""
-    ts_match = re.search(r'(On\s+\w+,\s+\w+\s+\d+,\s+\d+\s+at\s+\d+:\d+\s*[APap][Mm])', body_text)
-    if ts_match:
-        wrote_line = f'{ts_match.group(1)} {from_address} wrote:'
-        print(f"[fetch_uuid] Extracted wrote_line from body.text: {wrote_line}")
-    else:
-        print(f"[fetch_uuid] Could not extract timestamp from body.text, will skip wrote line")
-
-    print(f"[fetch_uuid] reply_to_uuid={uuid} eaccount={eaccount} thread_html_len={len(thread_html)} for {lead_email}")
-    return uuid, eaccount, thread_html, wrote_line
+    thread_html = "".join(f"<div>{m.get('email_body', '')}</div>" for m in history)
+    print(f"[thread] history={len(history)} msgs, latest reply stats_id={latest_reply.get('stats_id')}")
+    return {
+        "stats_id": latest_reply.get("stats_id"),
+        "message_id": latest_reply.get("message_id"),
+        "reply_time": latest_reply.get("time"),
+        "reply_html": latest_reply.get("email_body", ""),
+        "eaccount": (sent[-1].get("from") if sent else data.get("from", "")) or "",
+        "subject": latest_reply.get("subject") or (sent[-1].get("subject") if sent else ""),
+        "thread_html": thread_html,
+    }
 
 
-def send_instantly_reply(reply_to_uuid: str, eaccount: str, subject: str,
-                         body: str, thread_html: str = "",
-                         wrote_line: str = "") -> dict:
-    """Send a reply via Instantly with proper HTML threading."""
+def send_smartlead_reply(campaign_id, stats_id, reply_message_id: str, body: str,
+                         lead_email: str = "", reply_email_time: str = "",
+                         reply_email_body: str = "") -> dict:
+    """
+    Send a reply via Smartlead's master inbox:
+    POST /campaigns/{campaign_id}/reply-email-thread?api_key=...
+    Smartlead threads the message itself using reply_message_id, so we only
+    send our own HTML body (no manual quoting of the prior thread).
+    """
     # Convert markdown autolinks <https://...> into real anchor tags
-    # so they don't get stripped as unknown HTML tags.
-    body = re.sub(
-        r'<(https?://[^>\s]+)>',
-        r'<a href="\1">\1</a>',
-        body,
-    )
-
-    html_body = body.replace("\n", "<br>")
-    full_html = f"<div>{html_body}</div>"
-    if thread_html:
-        if wrote_line:
-            full_html += (
-                f'<br><div class="gmail_quote">'
-                f'<div dir="ltr" class="gmail_attr">{wrote_line}<br></div>'
-                f'<blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">'
-                f'{thread_html}'
-                f'</blockquote></div>'
-            )
-        else:
-            full_html += f"<br>{thread_html}"
+    body = re.sub(r'<(https?://[^>\s]+)>', r'<a href="\1">\1</a>', body)
+    html_body = "<div>" + body.replace("\n", "<br>") + "</div>"
 
     payload = {
-        "reply_to_uuid": reply_to_uuid,
-        "eaccount": eaccount,
-        "subject": subject,
-        "body": {"html": full_html},
+        "email_stats_id": stats_id,
+        "email_body": html_body,
+        "reply_message_id": reply_message_id,
+        "add_signature": False,
     }
-    print(f"[send_reply] Payload: {json.dumps(payload)[:500]}")
+    if lead_email:
+        payload["to_email"] = lead_email
+    if reply_email_time:
+        payload["reply_email_time"] = reply_email_time
+    if reply_email_body:
+        payload["reply_email_body"] = reply_email_body
+
+    print(f"[send_reply] campaign={campaign_id} payload={json.dumps(payload)[:500]}")
     resp = requests.post(
-        "https://api.instantly.ai/api/v2/emails/reply",
-        headers={
-            "Authorization": f"Bearer {INSTANTLY_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        f"{SMARTLEAD_BASE}/campaigns/{campaign_id}/reply-email-thread",
+        params={"api_key": SMARTLEAD_API_KEY},
+        headers={"Content-Type": "application/json"},
         json=payload,
     )
-    print(f"[send_reply] Instantly status={resp.status_code} body={resp.text[:300]}")
+    print(f"[send_reply] Smartlead status={resp.status_code} body={resp.text[:300]}")
     resp.raise_for_status()
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError:
+        return {"ok": True, "raw": resp.text[:300]}
+
+
+def _send_from_meta(meta: dict, body: str) -> dict:
+    """Shared send path for the Slack button and the Slack thread edit flow."""
+    campaign_id = meta.get("campaign_id")
+    stats_id = meta.get("stats_id")
+    message_id = meta.get("message_id", "")
+    lead_email = clean_slack_email(meta.get("lead_email", ""))
+    reply_time = meta.get("reply_time", "")
+    reply_html = meta.get("reply_html", "")
+
+    # If button metadata was trimmed, refetch the latest reply from Smartlead
+    if meta.get("refetch_thread") and campaign_id and meta.get("lead_id"):
+        try:
+            t = fetch_smartlead_thread(campaign_id, meta["lead_id"])
+            stats_id = t["stats_id"] or stats_id
+            message_id = t["message_id"] or message_id
+            reply_time = t["reply_time"] or reply_time
+            reply_html = t["reply_html"] or reply_html
+        except Exception as e:
+            print(f"[send_reply] Failed to refetch thread: {e}")
+
+    if not (campaign_id and stats_id):
+        raise ValueError(f"missing campaign_id or stats_id. meta keys: {list(meta.keys())}")
+
+    return send_smartlead_reply(
+        campaign_id=campaign_id,
+        stats_id=stats_id,
+        reply_message_id=message_id,
+        body=body,
+        lead_email=lead_email,
+        reply_email_time=reply_time,
+        reply_email_body=reply_html,
+    )
 
 
 # ============================================================
-# ROUTE 1: Incoming email reply webhook (from Instantly)
+# ROUTE 1: Incoming email reply webhook (from Smartlead, EMAIL_REPLY event)
 # ============================================================
 
 @app.route("/webhook/incoming", methods=["POST"])
 def incoming_reply():
-    data = request.json
+    data = request.json or {}
     body = data.get("body", data)
 
-    lead_email = str(body.get("lead_email", ""))
+    if SMARTLEAD_WEBHOOK_SECRET and body.get("secret_key") != SMARTLEAD_WEBHOOK_SECRET:
+        print("[incoming] Rejected webhook: bad secret_key")
+        return jsonify({"status": "unauthorized"}), 401
 
-    reply_snippet = body.get("reply_text_snippet", "")
-    reply_text = body.get("reply_text", "")
-    campaign_name = body.get("campaign_name", "")
+    event_type = body.get("event_type", "")
+    if event_type and event_type != "EMAIL_REPLY":
+        print(f"[incoming] Ignoring event_type={event_type}")
+        return jsonify({"status": "ignored", "event_type": event_type}), 200
+
+    # --- Smartlead payload fields ---
+    lead_email = str(body.get("sl_lead_email") or body.get("to_email") or "")
+    eaccount = str(body.get("from_email", ""))          # our sending mailbox
     campaign_id = body.get("campaign_id", "")
+    campaign_name = body.get("campaign_name", "")
+    lead_id = body.get("sl_email_lead_id", "")
+    stats_id = body.get("stats_id", "")
+    message_id = body.get("message_id") or (body.get("reply_message") or {}).get("message_id", "")
+    reply_time = body.get("time_replied") or body.get("event_timestamp", "")
+    reply_category = body.get("reply_category", "")
+    subject = body.get("subject") or "Re:"
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}"
 
-    subject = body.get("reply_subject") or body.get("subject") or "Re:"
-    domain = lead_email.split("@")[1] if "@" in lead_email else ""
+    reply_msg = body.get("reply_message") or {}
+    sent_msg = body.get("sent_message") or {}
+    reply_html = reply_msg.get("html") or body.get("reply_body", "")
+    reply_snippet = reply_msg.get("text") or body.get("preview_text") or _strip_html(reply_html)
+    sent_text = sent_msg.get("text") or _strip_html(sent_msg.get("html") or body.get("sent_message_body", ""))
 
-    # Extract clean lead response for Slack display
-    lead_response = extract_lead_response(reply_text, reply_snippet, campaign_name)
+    if not stats_id or not campaign_id:
+        print(f"[incoming] Missing stats_id or campaign_id. keys={list(body.keys())}")
+        return jsonify({"status": "skipped", "reason": "missing_ids"}), 200
 
-    # Step 1: Resolve the reply_to_uuid + thread HTML from Instantly
-    try:
-        reply_to_uuid, eaccount, thread_html, wrote_line = fetch_instantly_reply_uuid(campaign_id, lead_email)
-    except ValueError:
-        print(f"[incoming] No emails found on first try for {lead_email}. Retrying in 3s...")
-        time.sleep(3)
-        try:
-            reply_to_uuid, eaccount, thread_html, wrote_line = fetch_instantly_reply_uuid(campaign_id, lead_email)
-        except ValueError as e:
-            print(f"[incoming] Still no emails after retry for {lead_email}. Skipping. Error: {e}")
-            return jsonify({"status": "skipped", "reason": "no_emails_found"}), 200
+    print(f"[incoming] campaign={campaign_id} ({campaign_name}) lead={lead_email} from={eaccount} stats_id={stats_id} category={reply_category}")
 
-    # Step 2: Extract sender name
+    # Step 1: Clean lead response for Slack display
+    lead_response = extract_lead_response(reply_html, reply_snippet, campaign_name)
+
+    # Step 2: Sender name from our mailbox
     sender_name = extract_sender_name(eaccount)
 
-    # Step 3: Upsert Attio company + person + deal
-    upsert_attio_company(domain)
-    upsert_attio_person(lead_email)
-    deal = create_attio_deal(lead_email)
-    deal_id = deal["data"]["id"]["record_id"]
+    # Step 3 (Attio) -- disabled for now
+    # upsert_attio_company(domain)
+    # upsert_attio_person(lead_email)
+    # deal = create_attio_deal(lead_email)
 
-    # Step 4: Fetch available Calendly slots and draft reply with Claude
+    # Step 4: Calendly slots + Claude draft
     cal_info = get_calendly_info(eaccount, campaign_name)
     available_slots = fetch_available_slots(cal_info["event_type"])
-    scheduling_block = format_slots_for_email(available_slots, cal_info["fallback_url"])
     slack_slots_text = format_slots_for_slack(available_slots, cal_info["fallback_url"])
-    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, reply_text)
+    thread_for_claude = (
+        "ORIGINAL OUTBOUND EMAIL (sent by us):\n" + sent_text +
+        "\n\n---\n\nPROSPECT'S REPLY:\n" + lead_response
+    )
+    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, thread_for_claude)
     print(f"[draft] Generated {len(draft)} chars for {lead_email} ({len(available_slots)} days of slots fetched)")
 
-    # Step 5: Build Slack message with action buttons
-    meta_send = json.dumps({
-        "reply_to_uuid": reply_to_uuid,
-        "eaccount": eaccount,
-        "subject": subject,
-        "lead_email": lead_email,
-        "deal_id": deal_id,
-        "draft": draft,
-        "thread_html": thread_html,
-        "wrote_line": wrote_line,
-    })
-    meta_edit = json.dumps({
-        "reply_to_uuid": reply_to_uuid,
-        "eaccount": eaccount,
-        "subject": subject,
-        "lead_email": lead_email,
-        "deal_id": deal_id,
-        "draft": draft,
+    # Step 5: Slack message with action buttons
+    base_meta = {
         "campaign_id": campaign_id,
-        "thread_html": thread_html,
-    })
-    meta_dismiss = json.dumps({
-        "deal_id": deal_id,
+        "stats_id": stats_id,
+        "message_id": message_id,
+        "lead_id": lead_id,
+        "eaccount": eaccount,
         "lead_email": lead_email,
-    })
+        "subject": subject,
+        "reply_time": reply_time,
+    }
+    meta_send = json.dumps({**base_meta, "draft": draft, "reply_html": reply_html})
+    meta_edit = json.dumps({**base_meta, "draft": draft})
+    meta_dismiss = json.dumps({"lead_email": lead_email, "stats_id": stats_id})
 
+    if len(meta_send) > 1900:
+        print(f"[warn] Meta payload too large for Slack button (send={len(meta_send)}). Dropping reply_html.")
+        meta_send = json.dumps({**base_meta, "draft": draft, "refetch_thread": True})
     if len(meta_send) > 1900 or len(meta_edit) > 1900:
-        print(f"[warn] Meta payload too large for Slack buttons (send={len(meta_send)}, edit={len(meta_edit)}). Dropping thread_html from button meta.")
-        meta_send = json.dumps({
-            "reply_to_uuid": reply_to_uuid,
-            "eaccount": eaccount,
-            "subject": subject,
-            "lead_email": lead_email,
-            "deal_id": deal_id,
-            "draft": draft,
-            "campaign_id": campaign_id,
-            "refetch_thread": True,
-        })
-        meta_edit = json.dumps({
-            "reply_to_uuid": reply_to_uuid,
-            "eaccount": eaccount,
-            "subject": subject,
-            "lead_email": lead_email,
-            "deal_id": deal_id,
-            "draft": draft,
-            "campaign_id": campaign_id,
-            "refetch_thread": True,
-        })
+        print(f"[warn] Meta still too large (send={len(meta_send)}, edit={len(meta_edit)}). Dropping draft from buttons.")
+        meta_send = json.dumps({**base_meta, "refetch_thread": True})
+        meta_edit = json.dumps({**base_meta, "refetch_thread": True})
+
+    inbox_link = body.get("ui_master_inbox_link") or body.get("app_url", "")
+    header = (
+        f"\U0001f514 *New Reply*" + (f" ({reply_category})" if reply_category else "") + "\n"
+        f"*Campaign:* {campaign_name}\n"
+        f"*Sender:* {eaccount}\n"
+        f"*Lead:* {lead_email}"
+    )
+    if inbox_link:
+        header += f"\n<{inbox_link}|Open in Smartlead inbox>"
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text":
-            f"\U0001f514 *New Interested Reply*\n"
-            f"*Campaign:* {campaign_name}\n"
-            f"*Sender:* {eaccount}\n"
-            f"*Lead:* {lead_email}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*Lead's Reply:*\n{lead_response}"}},
@@ -639,18 +662,18 @@ def incoming_reply():
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"*AI Draft:*\n{draft}"}},
         {"type": "actions", "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "\u2705 Send Reply"},
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Send Reply"},
              "style": "primary", "action_id": "send_reply", "value": meta_send},
-            {"type": "button", "text": {"type": "plain_text", "text": "\u270f\ufe0f Edit & Send"},
+            {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit & Send"},
              "action_id": "edit_reply", "value": meta_edit},
-            {"type": "button", "text": {"type": "plain_text", "text": "\u274c Dismiss"},
+            {"type": "button", "text": {"type": "plain_text", "text": "❌ Dismiss"},
              "style": "danger", "action_id": "dismiss", "value": meta_dismiss},
         ]},
     ]
 
     send_slack_message(blocks)
 
-    return jsonify({"status": "interested", "deal_id": deal_id}), 200
+    return jsonify({"status": "posted_to_slack", "stats_id": stats_id}), 200
 
 
 # ============================================================
@@ -663,88 +686,78 @@ def slack_actions():
     action = payload.get("actions", [{}])[0]
     action_id = action.get("action_id", "")
     meta = json.loads(action.get("value", "{}"))
-    print(f"[slack_action] action_id={action_id} reply_to_uuid={meta.get('reply_to_uuid')} eaccount={meta.get('eaccount')} lead={meta.get('lead_email')}")
+    print(f"[slack_action] action_id={action_id} stats_id={meta.get('stats_id')} campaign={meta.get('campaign_id')} lead={meta.get('lead_email')}")
 
     channel_id = payload.get("container", {}).get("channel_id", "")
     message_ts = payload.get("container", {}).get("message_ts", "")
+    response_url = payload.get("response_url")
+    lead_email = clean_slack_email(meta.get("lead_email", ""))
 
     if action_id == "send_reply":
         draft = meta.get("draft", "")
-        thread_html = meta.get("thread_html", "")
-        wrote_line = meta.get("wrote_line", "")
+        stats_id = meta.get("stats_id", "")
 
-        if meta.get("refetch_thread") and meta.get("campaign_id"):
-            try:
-                _, _, thread_html, wrote_line = fetch_instantly_reply_uuid(
-                    meta["campaign_id"], clean_slack_email(meta.get("lead_email", ""))
-                )
-            except Exception as e:
-                print(f"[send_reply] Failed to refetch thread_html: {e}")
-
-        eaccount = clean_slack_email(meta.get("eaccount", ""))
-        lead_email = clean_slack_email(meta.get("lead_email", ""))
-        reply_uuid = meta.get("reply_to_uuid", "")
-
-        dedup_key = f"{reply_uuid}:send"
+        dedup_key = f"{stats_id}:send"
         if dedup_key in _sent_replies:
             print(f"[send_reply] Already sent for {dedup_key}. Skipping.")
             return "", 200
         _sent_replies.add(dedup_key)
 
-        print(f"[slack_action] send_reply triggered. reply_to_uuid={reply_uuid} eaccount={eaccount} lead={lead_email}")
-        if meta.get("reply_to_uuid") and eaccount:
-            result = send_instantly_reply(
-                reply_to_uuid=meta["reply_to_uuid"],
-                eaccount=eaccount,
-                subject=meta.get("subject", "Re:"),
-                body=draft,
-                thread_html=thread_html,
-                wrote_line=wrote_line,
-            )
-            print(f"[send_reply] Instantly response: {result}")
-        else:
-            print(f"[send_reply] SKIPPED -- missing reply_to_uuid or eaccount. meta keys: {list(meta.keys())}")
+        if not draft:
+            print("[send_reply] SKIPPED -- draft missing from button meta (too large). Use Edit & Send.")
+            if response_url:
+                requests.post(response_url, json={
+                    "replace_original": "false",
+                    "text": "⚠️ Draft too long for the button. Use Edit & Send instead.",
+                })
+            return "", 200
 
-        response_url = payload.get("response_url")
-        if response_url:
-            requests.post(response_url, json={
-                "replace_original": "true",
-                "text": f"\u2705 Reply sent to {lead_email}",
-            })
-
+        try:
+            result = _send_from_meta(meta, draft)
+            print(f"[send_reply] Smartlead response: {result}")
+            if response_url:
+                requests.post(response_url, json={
+                    "replace_original": "true",
+                    "text": f"✅ Reply sent to {lead_email}",
+                })
+        except Exception as e:
+            _sent_replies.discard(dedup_key)
+            print(f"[send_reply] Failed: {e}")
+            if response_url:
+                requests.post(response_url, json={
+                    "replace_original": "false",
+                    "text": f"❌ Failed to send reply to {lead_email}: {e}",
+                })
         return "", 200
 
     elif action_id == "edit_reply":
-        eaccount = clean_slack_email(meta.get("eaccount", ""))
-        lead_email = clean_slack_email(meta.get("lead_email", ""))
-
         thread_meta = json.dumps({
-            "reply_to_uuid": meta.get("reply_to_uuid"),
-            "eaccount": eaccount,
-            "subject": meta.get("subject", "Re:"),
+            "campaign_id": meta.get("campaign_id"),
+            "stats_id": meta.get("stats_id"),
+            "message_id": meta.get("message_id", ""),
+            "lead_id": meta.get("lead_id", ""),
+            "eaccount": clean_slack_email(meta.get("eaccount", "")),
             "lead_email": lead_email,
-            "deal_id": meta.get("deal_id"),
-            "campaign_id": meta.get("campaign_id", ""),
+            "subject": meta.get("subject", "Re:"),
+            "reply_time": meta.get("reply_time", ""),
+            "refetch_thread": True,
         })
 
         text = (
-            f"\u270f\ufe0f *Edit the draft below and reply to this thread to send it.*\n\n"
+            f"✏️ *Edit the draft below and reply to this thread to send it.*\n\n"
             f"{meta.get('draft', '')}\n\n"
             f"META: {thread_meta}"
         )
 
         post_slack_chat(channel_id, message_ts, text)
-
         print(f"[edit_reply] Posted draft to Slack thread for lead={lead_email}. Waiting for user reply.")
         return "", 200
 
     elif action_id == "dismiss":
-        lead_email = clean_slack_email(meta.get("lead_email", ""))
-        response_url = payload.get("response_url")
         if response_url:
             requests.post(response_url, json={
                 "replace_original": "true",
-                "text": f"\u274c Dismissed reply from {lead_email}",
+                "text": f"❌ Dismissed reply from {lead_email}",
             })
         return "", 200
 
@@ -757,7 +770,7 @@ def slack_actions():
 
 @app.route("/webhook/slack-events", methods=["POST"])
 def slack_events():
-    data = request.json
+    data = request.json or {}
 
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]}), 200
@@ -792,44 +805,25 @@ def slack_events():
         return "", 200
 
     meta = json.loads(meta_match.group(1))
-
-    eaccount = clean_slack_email(meta.get("eaccount", ""))
     lead_email = clean_slack_email(meta.get("lead_email", ""))
-    reply_uuid = meta.get("reply_to_uuid", "")
+    stats_id = meta.get("stats_id", "")
 
-    dedup_key = f"{reply_uuid}:{thread_ts}"
+    dedup_key = f"{stats_id}:{thread_ts}"
     if dedup_key in _sent_replies:
         print(f"[slack_events] Already sent reply for {dedup_key}. Skipping.")
         return "", 200
 
-    print(f"[slack_events] Sending edited reply directly. reply_to_uuid={reply_uuid} eaccount={eaccount} lead={lead_email} body_preview={reply_text[:80]}")
+    print(f"[slack_events] Sending edited reply. stats_id={stats_id} campaign={meta.get('campaign_id')} lead={lead_email} body_preview={reply_text[:80]}")
 
     try:
         _sent_replies.add(dedup_key)
-        thread_html = ""
-        wrote_line = ""
-        campaign_id = meta.get("campaign_id", "")
-        if campaign_id and lead_email:
-            try:
-                _, _, thread_html, wrote_line = fetch_instantly_reply_uuid(campaign_id, lead_email)
-            except Exception as e:
-                print(f"[slack_events] Could not fetch thread_html: {e}")
-
-        result = send_instantly_reply(
-            reply_to_uuid=meta.get("reply_to_uuid", ""),
-            eaccount=eaccount,
-            subject=meta.get("subject", "Re:"),
-            body=reply_text,
-            thread_html=thread_html,
-            wrote_line=wrote_line,
-        )
-        print(f"[edit_send] Instantly response: {result}")
-
-        post_slack_chat(channel, thread_ts, f"\u2705 Reply sent to {lead_email}")
-
+        result = _send_from_meta(meta, reply_text)
+        print(f"[edit_send] Smartlead response: {result}")
+        post_slack_chat(channel, thread_ts, f"✅ Reply sent to {lead_email}")
     except Exception as e:
+        _sent_replies.discard(dedup_key)
         print(f"[edit_send] Failed to send reply: {e}")
-        post_slack_chat(channel, thread_ts, f"\u274c Failed to send reply: {str(e)}")
+        post_slack_chat(channel, thread_ts, f"❌ Failed to send reply: {str(e)}")
 
     return "", 200
 
@@ -840,7 +834,7 @@ def slack_events():
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "email-reply-bot"}), 200
+    return jsonify({"status": "ok", "service": "email-reply-bot-smartlead"}), 200
 
 
 if __name__ == "__main__":
