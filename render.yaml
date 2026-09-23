@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: email-reply-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ATTIO_API_KEY
+        sync: false
+      - key: ATTIO_OWNER_ID
+        sync: false
+      - key: SLACK_WEBHOOK_URL
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: INSTANTLY_API_KEY
+        sync: false
