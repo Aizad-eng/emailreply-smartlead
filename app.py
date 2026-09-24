@@ -739,37 +739,83 @@ def incoming_reply():
         meta_edit = json.dumps({**base_meta, "refetch_thread": True})
 
     inbox_link = body.get("ui_master_inbox_link") or body.get("app_url", "")
+    no_response = draft.strip().upper().startswith("NO RESPONSE")
+
     sentiment_icon = {"Positive": "\U0001f7e2", "Negative": "\U0001f534"}.get(sentiment, "\u26aa")
-    header = (
-        f"\U0001f514 *New Reply*" + (f" ({reply_category})" if reply_category else "") + "\n"
-        f"*Sentiment:* {sentiment_icon} {sentiment}\n"
-        f"*Campaign:* {campaign_name}\n"
-        f"*Sender:* {eaccount}\n"
-        f"*Lead:* {lead_email}"
-    )
+
+    # Lead's reply as a quote block (Slack section text limit is 3000 chars)
+    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in lead_response.strip().splitlines())
+    if len(quoted) > 2500:
+        quoted = quoted[:2500].rstrip() + "\n> _[truncated]_"
+
+    # Received time in a friendly format
+    try:
+        received = datetime.fromisoformat(str(reply_time).replace("Z", "+00:00"))
+        received_str = received.strftime("%b %d, %Y at %I:%M %p UTC").replace(" 0", " ")
+    except Exception:
+        received_str = ""
+
+    fields = [
+        {"type": "mrkdwn", "text": f"*Campaign*\n{campaign_name or '-'}"},
+        {"type": "mrkdwn", "text": f"*Sentiment*\n{sentiment_icon} {sentiment}"},
+        {"type": "mrkdwn", "text": f"*Lead*\n{lead_email or '-'}"},
+        {"type": "mrkdwn", "text": f"*Sent from*\n{eaccount or '-'}"},
+    ]
+    if reply_category:
+        fields.append({"type": "mrkdwn", "text": f"*Smartlead category*\n{reply_category}"})
+
+    context_parts = []
     if inbox_link:
-        header += f"\n<{inbox_link}|Open in Smartlead inbox>"
+        context_parts.append(f"<{inbox_link}|Open in Smartlead inbox>")
+    if received_str:
+        context_parts.append(f"Received {received_str}")
+    if subject:
+        context_parts.append(f"Subject: {subject}")
+
+    if no_response:
+        draft_section = (
+            "*Suggested reply*\n"
+            "_No reply recommended. The lead declined or asked not to be contacted._\n"
+            "Use *Edit & Send* if you still want to respond."
+        )
+    else:
+        draft_section = f"*Suggested reply*\n{draft}"
+
+    buttons = []
+    if not no_response:
+        buttons.append(
+            {"type": "button", "text": {"type": "plain_text", "text": "Send reply", "emoji": True},
+             "style": "primary", "action_id": "send_reply", "value": meta_send,
+             "confirm": {
+                 "title": {"type": "plain_text", "text": "Send this reply?"},
+                 "text": {"type": "mrkdwn", "text": f"This will email *{lead_email}* from *{eaccount}* via Smartlead."},
+                 "confirm": {"type": "plain_text", "text": "Send"},
+                 "deny": {"type": "plain_text", "text": "Cancel"},
+             }},
+        )
+    buttons.append(
+        {"type": "button", "text": {"type": "plain_text", "text": "Edit & send", "emoji": True},
+         "action_id": "edit_reply", "value": meta_edit},
+    )
+    buttons.append(
+        {"type": "button", "text": {"type": "plain_text", "text": "Dismiss", "emoji": True},
+         "style": "danger", "action_id": "dismiss", "value": meta_dismiss},
+    )
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+        {"type": "header", "text": {"type": "plain_text",
+            "text": f"{sentiment_icon} New reply from {lead_email}"[:150], "emoji": True}},
+        {"type": "section", "fields": fields},
+    ]
+    if context_parts:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "  \u2022  ".join(context_parts)}]})
+    blocks += [
         {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text":
-            f"*Lead's Reply:*\n{lead_response}"}},
-        # Available time slots block disabled for now:
-        # {"type": "divider"},
-        # {"type": "section", "text": {"type": "mrkdwn", "text":
-        #     f"*Available Time Slots:*\n{slack_slots_text}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Lead's reply*\n{quoted}"}},
         {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text":
-            f"*AI Draft:*\n{draft}"}},
-        {"type": "actions", "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "✅ Send Reply"},
-             "style": "primary", "action_id": "send_reply", "value": meta_send},
-            {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit & Send"},
-             "action_id": "edit_reply", "value": meta_edit},
-            {"type": "button", "text": {"type": "plain_text", "text": "❌ Dismiss"},
-             "style": "danger", "action_id": "dismiss", "value": meta_dismiss},
-        ]},
+        {"type": "section", "text": {"type": "mrkdwn", "text": draft_section}},
+        {"type": "actions", "elements": buttons},
     ]
 
     send_slack_message(blocks)
