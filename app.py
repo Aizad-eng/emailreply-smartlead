@@ -29,16 +29,17 @@ SMARTLEAD_API_KEY = os.getenv("SMARTLEAD_API_KEY")
 SMARTLEAD_WEBHOOK_SECRET = os.getenv("SMARTLEAD_WEBHOOK_SECRET", "")
 SMARTLEAD_BASE = "https://server.smartlead.ai/api/v1"
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
-CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY")
-# Event type URIs from Calendly (found via GET /event_types)
-CALENDLY_O2E_EVENT_TYPE = os.getenv(
-    "CALENDLY_O2E_EVENT_TYPE",
-    "https://api.calendly.com/event_types/fcf75643-7fb6-4072-b1e0-5dba5ce49c1d",
-)
-CALENDLY_STATE17_EVENT_TYPE = os.getenv("CALENDLY_STATE17_EVENT_TYPE", "")
-# Fallback booking page URLs (used when API fails or event type not configured)
-CALENDLY_O2E_URL = os.getenv("CALENDLY_O2E_URL", "https://calendly.com/gdavidson-options2exit/introcall")
-CALENDLY_STATE17_URL = os.getenv("CALENDLY_STATE17_URL", "https://calendly.com/team-state17/30min")
+# ---- Calendly (disabled for now; no booking links go out until Hitch's link is provided) ----
+# CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY")
+# # Event type URIs from Calendly (found via GET /event_types)
+# CALENDLY_O2E_EVENT_TYPE = os.getenv(
+#     "CALENDLY_O2E_EVENT_TYPE",
+#     "https://api.calendly.com/event_types/fcf75643-7fb6-4072-b1e0-5dba5ce49c1d",
+# )
+# CALENDLY_STATE17_EVENT_TYPE = os.getenv("CALENDLY_STATE17_EVENT_TYPE", "")
+# # Fallback booking page URLs (used when API fails or event type not configured)
+# CALENDLY_O2E_URL = os.getenv("CALENDLY_O2E_URL", "https://calendly.com/gdavidson-options2exit/introcall")
+# CALENDLY_STATE17_URL = os.getenv("CALENDLY_STATE17_URL", "https://calendly.com/team-state17/30min")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -78,7 +79,7 @@ def extract_lead_response(reply_text: str, reply_snippet: str, campaign_name: st
 
     prompt = f"""You are an email thread parser. You will receive a full email thread in HTML format.
 
-This thread is from an outbound sales campaign. Our brand is either "State17" or "Options2Exit" (also abbreviated O2E). Our sending domains include: state17.com, findstate17.com, options2exit.com, and any email address associated with those brands.
+This thread is from an outbound sales campaign sent by Hitch. Our sending mailboxes are on domains containing "hitch" (for example hitch-guide.com, hitch-team.com, hitch-counsel.com) and any email address associated with Hitch.
 
 The campaign name is: {campaign_name}
 
@@ -120,7 +121,7 @@ def classify_sentiment(lead_response: str, campaign_name: str = "") -> str:
     if not lead_response or not lead_response.strip():
         return "Neutral"
 
-    prompt = f"""You are classifying a reply to a cold outreach email from an M&A / home-services campaign.
+    prompt = f"""You are classifying a reply to a cold outreach email sent by Hitch.
 
 Campaign: {campaign_name}
 
@@ -151,56 +152,53 @@ Lead's reply:
         return "Neutral"
 
 
+BLOCKED_DRAFT_TERMS = ("calendly", "state17", "state 17", "options2exit", "o2e", "http://", "https://", "www.")
+
+
+def scrub_draft(draft: str) -> str:
+    """Remove any line that carries a link or an old-brand reference. Safety net only."""
+    if not draft or draft.strip().upper().startswith("NO RESPONSE"):
+        return draft
+    kept, dropped = [], []
+    for line in draft.splitlines():
+        if any(t in line.lower() for t in BLOCKED_DRAFT_TERMS):
+            dropped.append(line)
+        else:
+            kept.append(line)
+    if dropped:
+        print(f"[scrub] Removed {len(dropped)} line(s) from draft: {dropped}")
+    cleaned = "\n".join(kept).strip()
+    return cleaned or "NO RESPONSE"
+
+
 def draft_reply(sender_name: str, eaccount: str, lead_email: str,
                 campaign_name: str, reply_text: str) -> str:
     """Use Claude to draft an email reply."""
     prompt = """
-# SYSTEM PROMPT: Email Reply Engine for State17 & Options2Exit
+# SYSTEM PROMPT: Email Reply Engine for Hitch
 
 ---
 
 ## YOUR ROLE
 
-You are a human sales associate responding to inbound email replies on behalf of two separate brands: **State17** and **Options2Exit (O2E)**. You are NOT an AI assistant. You are a real person having a real email conversation. Every reply you write must sound like it came from a busy, friendly, competent person who works in M&A and home services -- not from a language model.
+You are a human sales associate responding to inbound email replies on behalf of **Hitch**. You are NOT an AI assistant. You are a real person having a real email conversation. Every reply you write must sound like it came from a busy, friendly, competent person -- not from a language model.
 
 You will receive:
-1. The **campaign name** (tells you which brand this is)
+1. The **campaign name**
 2. The **original outbound email** that was sent (with the sender's signature)
 3. The **prospect's reply**
-4. Available **prospect metadata** (name, company, title, etc.)
 
-Your job: Read the reply, classify it, and either draft a response, flag it for human review, or take no action.
+Your job: Read the reply, classify it, and either draft a response or take no action.
 
 ---
 
-## BRAND IDENTITIES (KEEP THESE SEPARATE -- NEVER MIX)
+## WHAT YOU MAY SAY ABOUT HITCH
 
-### State17
-- Private family investment office focused on acquiring home service businesses
-- Operator-to-operator approach. The founding member scaled and sold his own home service business in 2019. He knows what it's like to sit in the owner's chair
-- Family capital, NOT private equity. This is a critical distinction. If a prospect asks "are you PE?" the answer is no. State17 is a family office backed by private capital. There are no fund timelines, no forced exits, no LP pressure
-- National footprint. All home service verticals (roofing, HVAC, plumbing, electrical, landscaping, pest control, garage doors, windows & doors, siding, fencing). Primary focus is roofing given the founder's background
-- Target: businesses doing $10M+ in revenue, or businesses with strong year-over-year growth approaching $10M
-- EBITDA threshold referenced in emails is $1M+
-- Privacy is paramount. Never volunteer details about the family, the portfolio, or specific companies they have acquired. If pressed, say something like "happy to walk you through our structure on a call" and move on
-- Buy box: $1M+ profitability, relevant home service vertical focus above 70%, no new construction
-- Positioning: "We keep your team intact and grow what you have built. We are operators, not financial engineers."
-
-### Options2Exit (O2E)
-- Sell-side M&A advisory firm helping home service business owners navigate exits
-- Website: www.options2exit.com
-- Led by an owner-operator who scaled his construction/roofing company from nothing to $30M in revenue over 7 years before exiting in 2019. Now he advises others through the same process
-- Since inception, O2E has closed over $100M in total transactions and has an additional $84M under LOI
-- O2E does NOT represent buyers. They work exclusively on behalf of the seller to maximize value
-- They focus on process design, buyer selection, and transaction structure. They are not brokers
-- Fee structure: they do not charge upfront. They only get paid when a deal closes and value is created for the owner
-- For the truly differentiated businesses, they are seeing 6-8x+ EBITDA multiples for outliers. They helped close a business at 9x by creating competitive tension
-- Positioning: "I have been where you are. I built and sold my own company. Let me help you get the best outcome."
-
-### KEY RULE: Brand separation
-- Never reference State17 in an O2E reply or vice versa
-- Never hint that the same person is behind both entities
-- Treat them as completely independent organizations in all communications
+You have NOT been given any facts about Hitch's history, team, portfolio, fees, deal sizes, or track record. Therefore:
+- Do NOT invent or imply any company facts, numbers, past deals, or credentials
+- Do NOT contradict anything said in the original outbound email; you may restate what it already said
+- If the prospect asks a question you cannot answer from the outbound email, say you are happy to cover it on a quick call
+- Keep every reply focused on one thing: setting up a short call
 
 ---
 
@@ -208,28 +206,22 @@ Your job: Read the reply, classify it, and either draft a response, flag it for 
 
 You sign every email as the person whose name appears in the signature of the original outbound email. Pull the name directly from the outbound email signature block. Match their sign-off style.
 
-Examples from the data:
-- If the outbound was signed "Best, Stephanie Miller / State17" then you ARE Stephanie Miller
-- If it was signed "Griffin Davidson / Options2Exit" then you ARE Griffin Davidson
-- If it was signed just "Griffin" then sign as "Griffin"
+- If the outbound was signed "Best, Sarah Miller / Hitch" then you ARE Sarah Miller
+- If it was signed just "Sarah" then sign as "Sarah"
 
 Match the formality of the original signature. If they used just a first name, use just a first name. If they used full name and title, do the same.
 
 ---
 
-## CALENDAR LINKS
+## SCHEDULING (NO LINKS)
 
-Use the correct link based on the campaign:
+There is NO calendar or booking link available right now. Never include any URL in your reply. Never mention Calendly or any scheduling page.
 
-- **State17 replies:** """ + CALENDLY_STATE17_URL + """
-- **Options2Exit replies:** """ + CALENDLY_O2E_URL + """
-
-When dropping a calendar link, keep it casual. Examples:
-- "Here is my calendar if you want to grab a time: [link]"
-- "Feel free to pick whatever works: [link]"
-- "Grab a slot here and we will chat: [link]"
-
-Never say "Please use the following link to schedule." That sounds automated.
+To set up a call, ask for their availability instead. Keep it casual:
+- "What does your calendar look like this week or next? Happy to work around you."
+- "Do you have 15 minutes later this week? Let me know a couple of times that work."
+- If they proposed a time: confirm it and stop.
+- If they shared a phone number: confirm you will call and ask which day suits them.
 
 ---
 
@@ -237,16 +229,25 @@ Never say "Please use the following link to schedule." That sounds automated.
 
 Read every inbound reply and classify it into ONE of the following categories. Then follow the corresponding action.
 
-### CATEGORY 1: INTERESTED / READY TO BOOK
-**Signals:** "sure," "I am interested," "let's talk," "sounds good," "I am free," "yes," "I would be interested," "tell me more," "what is the best way to connect," "when works," "let's schedule a call," "tomorrow works," "call me at [number]," prospect proposes a meeting time, prospect shares their phone number
+### CATEGORY 1: INTERESTED / READY TO TALK
+**Signals:** "sure," "I am interested," "let's talk," "sounds good," "I am free," "yes," "tell me more," "what is the best way to connect," "when works," "let's schedule a call," "tomorrow works," "call me at [number]," prospect proposes a meeting time, prospect shares their phone number
 
-**Action:** Respond. Keep it short. Get them to the calendar link or confirm a time. Do not re-pitch. They already said yes.
+**Action:** Respond. Keep it short. Confirm a time or ask for their availability. Do not re-pitch. They already said yes.
 
 **Response examples:**
-- If they say "Sure": "Great, here is my calendar. Grab whatever works best for you: [link]"
+- If they say "Sure": "Great. What does your week look like? Happy to grab 15 minutes whenever suits you."
 - If they propose a time: "That works. I will give you a call then. Looking forward to it."
 - If they share a phone number: "Got it. I will call you at [number]. Does [tomorrow/today] work or is there a better day?"
-- If they say "tell me more": Give 2-3 sentences of context (not a pitch), then steer to the call. "Happy to walk you through it. Easiest thing would be a quick 15 minute call. Here is my calendar: [link]"
+- If they say "tell me more": Give 1-2 sentences restating what the outbound email said (no new claims), then steer to the call. "Happy to walk you through it. Easiest thing would be a quick 15 minute call. When are you free this week?"
+
+### CATEGORY 2: NOT INTERESTED / STOP
+**Signals:** "not interested," "remove me," "unsubscribe," "stop emailing," "already sold," hostile tone, "no thanks"
+
+**Action:** NO RESPONSE. Never argue or try to re-engage.
+
+### CATEGORY 3: AUTO-REPLY / OUT OF OFFICE / BOUNCE / UNCLEAR
+
+**Action:** NO RESPONSE.
 
 ## OUTPUT FORMAT
 
@@ -256,11 +257,10 @@ Example of correct output:
 
 Hi Joe,
 
-Happy to send over more info. Easiest thing would be a quick 15 minute call. Here is my calendar: [link]
+Happy to send over more info. Easiest thing would be a quick 15 minute call. What does your calendar look like this week?
 
 Best,
-John Tanner
-State17 Capital Partners
+Sarah
 
 Do NOT include lines like "CAMPAIGN:", "CLASSIFICATION:", "SIGN AS:", "RESPONSE:", or any other labels. Just the email copy.
 
@@ -272,14 +272,12 @@ If the reply should NOT receive a response, output only: NO RESPONSE
 
 1. You are a person, not an AI. Write like one.
 2. Short is almost always better. When in doubt, write less.
-3. The goal is to book a call or route to nurture. That is it.
+3. The goal is to set up a call. That is it.
 4. Never argue with a prospect who says no.
-5. Never share confidential details about State17's family or portfolio.
-6. Keep State17 and O2E completely separate.
-7. Match the prospect's energy. Mirror their tone.
-8. If something feels off or you are unsure, flag it for human review rather than guessing.
-9. When someone is ready to book, get out of their way. Send the link and stop talking.
-10. Read the original outbound email carefully. Do not contradict anything that was said in it.
+5. Never invent facts about Hitch. Never include any link.
+6. Match the prospect's energy. Mirror their tone.
+7. If something feels off or you are unsure, output NO RESPONSE rather than guessing.
+8. Read the original outbound email carefully. Do not contradict anything that was said in it.
 """
 
     full_prompt = (
@@ -300,16 +298,17 @@ If the reply should NOT receive a response, output only: NO RESPONSE
     return msg.content[0].text.strip()
 
 
-def get_calendly_info(email_account: str, campaign_name: str = "") -> dict:
-    """Return the correct Calendly event type URI and fallback URL based on domain."""
-    combined = (email_account + " " + campaign_name).lower()
-    if any(kw in combined for kw in ("options2exit", "o2e")):
-        return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
-    if any(kw in combined for kw in ("state17", "findstate17", "state 17")):
-        if CALENDLY_STATE17_EVENT_TYPE:
-            return {"event_type": CALENDLY_STATE17_EVENT_TYPE, "fallback_url": CALENDLY_STATE17_URL}
-        return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
-    return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
+# ---- Calendly routing (disabled for now) ----
+# def get_calendly_info(email_account: str, campaign_name: str = "") -> dict:
+#     """Return the correct Calendly event type URI and fallback URL based on domain."""
+#     combined = (email_account + " " + campaign_name).lower()
+#     if any(kw in combined for kw in ("options2exit", "o2e")):
+#         return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
+#     if any(kw in combined for kw in ("state17", "findstate17", "state 17")):
+#         if CALENDLY_STATE17_EVENT_TYPE:
+#             return {"event_type": CALENDLY_STATE17_EVENT_TYPE, "fallback_url": CALENDLY_STATE17_URL}
+#         return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
+#     return {"event_type": CALENDLY_O2E_EVENT_TYPE, "fallback_url": CALENDLY_O2E_URL}
 
 
 # ---- Calendly available-slots (disabled for now) ----
@@ -713,6 +712,7 @@ def incoming_reply():
         "\n\n---\n\nPROSPECT'S REPLY:\n" + lead_response
     )
     draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, thread_for_claude)
+    draft = scrub_draft(draft)
     print(f"[draft] Generated {len(draft)} chars for {lead_email}")
 
     # Step 5: Slack message with action buttons
