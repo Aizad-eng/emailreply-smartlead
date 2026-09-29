@@ -28,6 +28,9 @@ SMARTLEAD_API_KEY = os.getenv("SMARTLEAD_API_KEY")
 # Optional: if set, incoming webhooks must carry a matching "secret_key" field.
 SMARTLEAD_WEBHOOK_SECRET = os.getenv("SMARTLEAD_WEBHOOK_SECRET", "")
 SMARTLEAD_BASE = "https://server.smartlead.ai/api/v1"
+# Any email address whose domain contains one of these keywords is one of OUR mailboxes
+# (hitch-guide.com, hitch-advisors.com, hitch-ventures.com, ...). Comma-separated.
+OWN_DOMAIN_KEYWORDS = [k.strip().lower() for k in os.getenv("OWN_DOMAIN_KEYWORDS", "hitch").split(",") if k.strip()]
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 # ---- Calendly (disabled for now; no booking links go out until Hitch's link is provided) ----
 # CALENDLY_API_KEY = os.getenv("CALENDLY_API_KEY")
@@ -483,6 +486,51 @@ def _strip_html(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _bare_email(value) -> str:
+    """'Devon Kessler <devon@hitch-advisors.com>' -> 'devon@hitch-advisors.com'"""
+    m = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+", str(value or ""))
+    return m.group(0).lower() if m else ""
+
+
+def is_own_address(value) -> bool:
+    """True if the address belongs to one of our own sending domains."""
+    email = _bare_email(value)
+    if "@" not in email:
+        return False
+    domain = email.split("@", 1)[1]
+    return any(k in domain for k in OWN_DOMAIN_KEYWORDS)
+
+
+def find_reply_author(body: dict, campaign_id, lead_id, message_id: str) -> str:
+    """
+    Work out who actually wrote the message Smartlead is calling a 'reply'.
+    Smartlead also fires EMAIL_REPLY for emails OUR team sends into the thread
+    from outside Smartlead, so the author must be checked.
+    """
+    corr = body.get("leadCorrespondence") or {}
+    reply_msg = body.get("reply_message") or {}
+    for candidate in (corr.get("replyReceivedFrom"), reply_msg.get("from"),
+                      reply_msg.get("from_email"), body.get("reply_from_email")):
+        email = _bare_email(candidate)
+        if email:
+            return email
+
+    # Not in the payload -- look the message up in Smartlead's thread history
+    if campaign_id and lead_id and message_id and SMARTLEAD_API_KEY:
+        try:
+            resp = requests.get(
+                f"{SMARTLEAD_BASE}/campaigns/{campaign_id}/leads/{lead_id}/message-history",
+                params={"api_key": SMARTLEAD_API_KEY}, timeout=15,
+            )
+            resp.raise_for_status()
+            for m in (resp.json() or {}).get("history", []):
+                if m.get("message_id") == message_id:
+                    return _bare_email(m.get("from"))
+        except Exception as e:
+            print(f"[author] History lookup failed: {e}")
+    return ""
+
+
 def fetch_smartlead_thread(campaign_id, lead_id) -> dict:
     """
     GET /campaigns/{campaign_id}/leads/{lead_id}/message-history
@@ -687,6 +735,20 @@ def incoming_reply():
         return jsonify({"status": "skipped", "reason": "missing_ids"}), 200
 
     print(f"[incoming] campaign={campaign_id} ({campaign_name}) lead={lead_email} from={eaccount} stats_id={stats_id} category={reply_category}")
+
+    # --- Only real lead replies get a card. Skip anything written by our own team. ---
+    reply_author = find_reply_author(body, campaign_id, lead_id, message_id)
+    if is_own_address(reply_author):
+        print(f"[incoming] Skipping: message was written by our own mailbox {reply_author}")
+        return jsonify({"status": "skipped", "reason": "sent_by_own_team", "author": reply_author}), 200
+    if is_own_address(lead_email):
+        print(f"[incoming] Skipping: lead address {lead_email} is one of our own domains")
+        return jsonify({"status": "skipped", "reason": "lead_is_own_domain"}), 200
+    if eaccount and not is_own_address(eaccount):
+        # The mailbox that received a genuine reply is always ours. If it is not,
+        # this event is one of our outgoing emails that Smartlead logged as a reply.
+        print(f"[incoming] Skipping: receiving mailbox {eaccount} is not ours (outgoing message logged as reply)")
+        return jsonify({"status": "skipped", "reason": "mailbox_not_own", "mailbox": eaccount}), 200
 
     # Step 1: Clean lead response for Slack display
     lead_response = extract_lead_response(reply_html, reply_snippet, campaign_name)

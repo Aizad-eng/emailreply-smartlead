@@ -11,6 +11,8 @@ services:
         sync: false
       - key: SMARTLEAD_WEBHOOK_SECRET
         sync: false
+      - key: OWN_DOMAIN_KEYWORDS
+        value: hitch
       - key: SLACK_WEBHOOK_URL
         sync: false
       - key: SLACK_BOT_TOKEN
