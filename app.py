@@ -19,9 +19,9 @@ app = Flask(__name__)
 
 # --- Config ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-# Attio is disabled for now -- see commented-out helpers below.
-# ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")
-# ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID")
+ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")        # leave unset to disable the Attio sync
+ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID")      # workspace member id; deals are only created when set
+ATTIO_DEAL_STAGE = os.getenv("ATTIO_DEAL_STAGE", "In Progress")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SMARTLEAD_API_KEY = os.getenv("SMARTLEAD_API_KEY")
@@ -400,48 +400,90 @@ def extract_sender_name(email_account: str) -> str:
     return first.capitalize()
 
 
-# ---- Attio (disabled for now) ----
-# def upsert_attio_company(domain: str) -> dict:
-#     resp = requests.put(
-#         "https://api.attio.com/v2/objects/companies/records",
-#         params={"matching_attribute": "domains"},
-#         headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
-#         json={"data": {"values": {"domains": [{"domain": domain}]}}},
-#     )
-#     resp.raise_for_status()
-#     return resp.json()
-#
-#
-# def upsert_attio_person(lead_email: str) -> dict:
-#     resp = requests.put(
-#         "https://api.attio.com/v2/objects/people/records",
-#         params={"matching_attribute": "email_addresses"},
-#         headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
-#         json={"data": {"values": {"email_addresses": [{"email_address": lead_email}]}}},
-#     )
-#     resp.raise_for_status()
-#     return resp.json()
-#
-#
-# def create_attio_deal(lead_email: str) -> dict:
-#     resp = requests.post(
-#         "https://api.attio.com/v2/objects/deals/records",
-#         headers={"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"},
-#         json={
-#             "data": {
-#                 "values": {
-#                     "name": [{"value": f"{lead_email} - Interested"}],
-#                     "stage": [{"status": "In Progress"}],
-#                     "owner": [{
-#                         "referenced_actor_type": "workspace-member",
-#                         "referenced_actor_id": ATTIO_OWNER_ID,
-#                     }],
-#                 }
-#             }
-#         },
-#     )
-#     resp.raise_for_status()
-#     return resp.json()
+# ---- Attio ----
+
+def _attio_headers() -> dict:
+    return {"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"}
+
+
+def upsert_attio_company(domain: str) -> dict:
+    resp = requests.put(
+        "https://api.attio.com/v2/objects/companies/records",
+        params={"matching_attribute": "domains"},
+        headers=_attio_headers(), timeout=20,
+        json={"data": {"values": {"domains": [{"domain": domain}]}}},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def upsert_attio_person(lead_email: str) -> dict:
+    resp = requests.put(
+        "https://api.attio.com/v2/objects/people/records",
+        params={"matching_attribute": "email_addresses"},
+        headers=_attio_headers(), timeout=20,
+        json={"data": {"values": {"email_addresses": [{"email_address": lead_email}]}}},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_attio_deal(lead_email: str, campaign_name: str = "") -> dict:
+    values = {
+        "name": [{"value": f"{lead_email} - Interested" + (f" ({campaign_name})" if campaign_name else "")}],
+        "stage": [{"status": ATTIO_DEAL_STAGE}],
+    }
+    if ATTIO_OWNER_ID:
+        values["owner"] = [{
+            "referenced_actor_type": "workspace-member",
+            "referenced_actor_id": ATTIO_OWNER_ID,
+        }]
+    resp = requests.post(
+        "https://api.attio.com/v2/objects/deals/records",
+        headers=_attio_headers(), timeout=20,
+        json={"data": {"values": values}},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "") -> dict:
+    """
+    Upsert the company + person for every real lead reply; create a deal only
+    for Positive replies. Never raises -- Attio problems must not block Slack.
+    Returns {"ok": bool, "summary": str, "deal_id": str|None}.
+    """
+    if not ATTIO_API_KEY:
+        return {"ok": False, "summary": "Attio: not configured", "deal_id": None}
+
+    domain = lead_email.split("@", 1)[1] if "@" in lead_email else ""
+    done = []
+    try:
+        if domain:
+            upsert_attio_company(domain)
+            done.append("company")
+        upsert_attio_person(lead_email)
+        done.append("person")
+        deal_id = None
+        if sentiment == "Positive":
+            deal = create_attio_deal(lead_email, campaign_name)
+            deal_id = deal.get("data", {}).get("id", {}).get("record_id")
+            done.append("deal")
+        summary = "Attio: synced " + " + ".join(done)
+        print(f"[attio] {summary} for {lead_email} deal_id={deal_id}")
+        return {"ok": True, "summary": summary, "deal_id": deal_id}
+    except requests.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("message") or e.response.text[:120]
+        except Exception:
+            detail = (e.response.text[:120] if e.response is not None else str(e))
+        step = ["company", "person", "deal"][len(done)] if len(done) < 3 else "?"
+        print(f"[attio] FAILED at {step}: {e.response.status_code if e.response is not None else ''} {detail}")
+        return {"ok": False, "summary": f"Attio: failed at {step} ({detail})", "deal_id": None}
+    except Exception as e:
+        print(f"[attio] FAILED: {e}")
+        return {"ok": False, "summary": f"Attio: failed ({e})", "deal_id": None}
 
 
 def send_slack_message(blocks: list) -> dict:
@@ -756,13 +798,11 @@ def incoming_reply():
     # Step 2: Sender name from our mailbox
     sender_name = extract_sender_name(eaccount)
 
-    # Step 3 (Attio) -- disabled for now
-    # upsert_attio_company(domain)
-    # upsert_attio_person(lead_email)
-    # deal = create_attio_deal(lead_email)
+    # Step 3: Attio CRM sync (runs after sentiment so deals are only made for Positive replies)
 
     # Step 3b: Sentiment label for the Slack card
     sentiment = classify_sentiment(lead_response, campaign_name)
+    attio = sync_to_attio(lead_email, sentiment, campaign_name)
 
     # Step 4: Claude draft
     # Calendly slot fetching disabled for now:
@@ -833,6 +873,8 @@ def incoming_reply():
         context_parts.append(f"Received {received_str}")
     if subject:
         context_parts.append(f"Subject: {subject}")
+    if ATTIO_API_KEY:
+        context_parts.append(("\u2705 " if attio["ok"] else "\u26a0\ufe0f ") + attio["summary"])
 
     if no_response:
         draft_section = (
@@ -1056,6 +1098,53 @@ def slack_events():
         post_slack_chat(channel, thread_ts, f"❌ Failed to send reply: {str(e)}")
 
     return "", 200
+
+
+# ============================================================
+# Attio connectivity check (read-only): GET /attio/check
+# ============================================================
+
+@app.route("/attio/check", methods=["GET"])
+def attio_check():
+    if not ATTIO_API_KEY:
+        return jsonify({"ok": False, "error": "ATTIO_API_KEY is not set"}), 200
+    out = {"ok": True, "owner_id_set": bool(ATTIO_OWNER_ID), "deal_stage": ATTIO_DEAL_STAGE}
+    try:
+        r = requests.get("https://api.attio.com/v2/self", headers=_attio_headers(), timeout=15)
+        r.raise_for_status()
+        me = r.json()
+        out["workspace"] = me.get("workspace_name")
+        out["scopes_ok"] = True
+    except Exception as e:
+        return jsonify({"ok": False, "step": "auth", "error": str(e)[:300]}), 200
+    try:
+        r = requests.get("https://api.attio.com/v2/objects", headers=_attio_headers(), timeout=15)
+        r.raise_for_status()
+        slugs = [o.get("api_slug") for o in r.json().get("data", [])]
+        out["objects"] = slugs
+        out["has_deals_object"] = "deals" in slugs
+    except Exception as e:
+        out["objects_error"] = str(e)[:300]
+    try:
+        r = requests.get("https://api.attio.com/v2/objects/deals/attributes/stage/statuses",
+                         headers=_attio_headers(), timeout=15)
+        r.raise_for_status()
+        stages = [s.get("title") for s in r.json().get("data", [])]
+        out["deal_stages"] = stages
+        out["deal_stage_valid"] = ATTIO_DEAL_STAGE in stages
+    except Exception as e:
+        out["deal_stages_error"] = str(e)[:300]
+    try:
+        r = requests.get("https://api.attio.com/v2/workspace_members", headers=_attio_headers(), timeout=15)
+        r.raise_for_status()
+        out["workspace_members"] = [
+            {"id": m.get("id", {}).get("workspace_member_id"), "email": m.get("email_address")}
+            for m in r.json().get("data", [])
+        ]
+    except Exception as e:
+        out["members_error"] = str(e)[:300]
+    out["ok"] = out.get("scopes_ok", False) and out.get("has_deals_object", False) and out.get("deal_stage_valid", False)
+    return jsonify(out), 200
 
 
 # ============================================================

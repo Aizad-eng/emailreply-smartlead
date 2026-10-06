@@ -13,6 +13,10 @@ services:
         sync: false
       - key: OWN_DOMAIN_KEYWORDS
         value: hitch
+      - key: ATTIO_API_KEY
+        sync: false
+      - key: ATTIO_OWNER_ID
+        sync: false
       - key: SLACK_WEBHOOK_URL
         sync: false
       - key: SLACK_BOT_TOKEN
