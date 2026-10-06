@@ -20,7 +20,7 @@ app = Flask(__name__)
 # --- Config ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")        # leave unset to disable the Attio sync
-ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID")      # workspace member id; deals are only created when set
+ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID", "5df13879-f0c5-4967-8982-23a2ca25b8de")  # default: devon@hitch-advisors.com
 ATTIO_DEAL_STAGE = os.getenv("ATTIO_DEAL_STAGE", "Interested")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
