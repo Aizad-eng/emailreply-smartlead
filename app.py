@@ -494,21 +494,30 @@ def add_attio_note(parent_object: str, record_id: str, title: str, content: str)
     }})
 
 
-def find_attio_deal_for_person(person_id: str):
-    """Return the most recent deal linked to this person, or None."""
-    if not person_id:
-        return None
-    try:
-        res = _attio("POST", "/objects/deals/records/query", json={
-            "filter": {"associated_people": {"target_object": "people", "target_record_id": person_id}},
-            "sorts": [{"attribute": "created_at", "direction": "desc"}],
-            "limit": 1,
-        })
-        rows = res.get("data", [])
-        return rows[0].get("id", {}).get("record_id") if rows else None
-    except Exception as e:
-        print(f"[attio] Deal lookup failed for person {person_id}: {e}")
-        return None
+def find_attio_deal_for_person(person_id: str, lead_email: str = ""):
+    """
+    Return the most recent deal for this lead, or None.
+    Looks for deals linked to the person first, then falls back to deals whose
+    name contains the lead email (deals made by earlier builds were not linked).
+    """
+    filters = []
+    if person_id:
+        filters.append({"associated_people": {"target_object": "people", "target_record_id": person_id}})
+    if lead_email:
+        filters.append({"name": {"$contains": lead_email}})
+    for flt in filters:
+        try:
+            res = _attio("POST", "/objects/deals/records/query", json={
+                "filter": flt,
+                "sorts": [{"attribute": "created_at", "direction": "desc"}],
+                "limit": 1,
+            })
+            rows = res.get("data", [])
+            if rows:
+                return rows[0].get("id", {}).get("record_id")
+        except Exception as e:
+            print(f"[attio] Deal lookup failed ({list(flt)[0]}): {e}")
+    return None
 
 
 def _trim_quoted(text: str) -> str:
@@ -547,7 +556,7 @@ def log_outbound_to_attio(lead_email: str, author: str, text: str, when: str = "
         if person_id:
             add_attio_note("people", person_id, title, body)
             done.append("person note")
-            deal_id = find_attio_deal_for_person(person_id)
+            deal_id = find_attio_deal_for_person(person_id, lead_email)
             if deal_id:
                 add_attio_note("deals", deal_id, title, body)
                 done.append("deal note")
@@ -603,7 +612,7 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         deal_id = None
         if sentiment == "Positive":
             step = "deal"
-            deal_id = find_attio_deal_for_person(person_id)
+            deal_id = find_attio_deal_for_person(person_id, lead_email)
             if deal_id:
                 done.append("existing deal")
             else:
@@ -615,7 +624,7 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         else:
             # Negative/Neutral: still keep the deal's history complete if one exists
             step = "deal note"
-            existing = find_attio_deal_for_person(person_id)
+            existing = find_attio_deal_for_person(person_id, lead_email)
             if existing:
                 add_attio_note("deals", existing, note_title, note_body)
                 done.append("deal note")
