@@ -1319,6 +1319,43 @@ def attio_check():
     return jsonify(out), 200
 
 
+@app.route("/attio/lookup", methods=["GET"])
+def attio_lookup():
+    """Read-only: what Attio holds for a lead email (person, reply status, deals, notes)."""
+    if not ATTIO_API_KEY:
+        return jsonify({"ok": False, "error": "ATTIO_API_KEY is not set"}), 200
+    email = _bare_email(request.args.get("email", ""))
+    if not email:
+        return jsonify({"ok": False, "error": "pass ?email="}), 200
+    out = {"ok": True, "email": email}
+    try:
+        res = _attio("POST", "/objects/people/records/query", json={
+            "filter": {"email_addresses": email}, "limit": 1})
+        rows = res.get("data", [])
+        if not rows:
+            out["person"] = None
+            return jsonify(out), 200
+        p = rows[0]
+        pid = p.get("id", {}).get("record_id")
+        vals = p.get("values", {})
+        out["person"] = {
+            "record_id": pid,
+            "name": [v.get("full_name") for v in vals.get("name", [])],
+            "reply_status": [v.get("option", {}).get("title") for v in vals.get(REPLY_STATUS_SLUG, [])],
+            "created_at": p.get("created_at"),
+        }
+        out["deal_id"] = find_attio_deal_for_person(pid)
+        notes = _attio("GET", "/notes", params={"parent_object": "people", "parent_record_id": pid, "limit": 20}).get("data", [])
+        out["notes"] = [{"title": n.get("title"), "created_at": n.get("created_at")} for n in notes]
+    except requests.HTTPError as e:
+        out["ok"] = False
+        out["error"] = (e.response.text[:300] if e.response is not None else str(e))
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)[:300]
+    return jsonify(out), 200
+
+
 @app.route("/attio/setup", methods=["GET", "POST"])
 def attio_setup():
     """One-off: create the People 'Reply status' select attribute if missing."""
