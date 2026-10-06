@@ -567,36 +567,198 @@ def _trim_quoted(text: str) -> str:
     return text[:cut].strip()
 
 
-def log_outbound_to_attio(lead_email: str, author: str, text: str, when: str = "",
-                          campaign_name: str = "", via: str = "") -> dict:
+SUMMARY_NOTE_TITLE = "Conversation summary"
+
+
+def _fmt_time(ts: str) -> str:
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(timezone.utc)
+        return dt.strftime("%b %d, %Y %I:%M %p UTC").replace(" 0", " ")
+    except Exception:
+        return str(ts or "-")
+
+
+def fetch_thread_messages(campaign_id, lead_id) -> tuple:
     """
-    Record an email WE sent to the lead (bot reply or a teammate's manual email)
-    as a note on the person and, if one exists, on their deal. Never raises.
+    Pull the whole thread from Smartlead, oldest first.
+    Returns (our_mailbox, [ {dir, who, time, text, kind} ]).
+    """
+    resp = requests.get(
+        f"{SMARTLEAD_BASE}/campaigns/{campaign_id}/leads/{lead_id}/message-history",
+        params={"api_key": SMARTLEAD_API_KEY}, timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json() or {}
+    history = data.get("history", []) if isinstance(data, dict) else []
+    mailbox = data.get("from", "") if isinstance(data, dict) else ""
+    msgs = []
+    for m in history:
+        who = _bare_email(m.get("from"))
+        text = _trim_quoted(_strip_html(m.get("email_body") or ""))
+        direction = "outbound" if is_own_address(who) else "inbound"
+        kind = "campaign email" if (direction == "outbound" and str(m.get("type", "")).upper() == "SENT"
+                                    and not m.get("reply_details") and m.get("email_seq_number")) else ""
+        msgs.append({"dir": direction, "who": who, "time": m.get("time", ""), "text": text, "kind": kind})
+    msgs.sort(key=lambda x: str(x.get("time", "")))
+    return mailbox, msgs
+
+
+def summarize_conversation(messages: list, campaign_name: str, lead_email: str) -> dict:
+    """Ask Claude for status / summary / key details / next step. Facts only."""
+    out = {"status": "", "summary": "", "details": [], "next_step": ""}
+    if not messages:
+        return out
+    thread = "\n\n".join(
+        f"[{i+1}] {_fmt_time(m['time'])} | {'PROSPECT' if m['dir']=='inbound' else 'OUR TEAM (' + m['who'] + ')'}:\n{m['text'][:1500]}"
+        for i, m in enumerate(messages)
+    )
+    prompt = f"""You maintain a CRM note for a sales conversation between our team at Hitch and a prospect ({lead_email}), campaign "{campaign_name}".
+Below is the full email thread, oldest first.
+
+Write exactly these four sections, plain text, no markdown:
+STATUS: one line on where things stand right now (e.g. "Call proposed for Thursday early afternoon, time not yet confirmed")
+SUMMARY: 2-4 sentences: what the prospect wants or asked, their concerns, what we have told them so far
+KEY DETAILS: one fact per line starting with "- ": phone numbers, proposed times, names and roles, requests (NDA, documents), objections, any numbers mentioned. Write "- none" if nothing.
+NEXT STEP: one line, a concrete action for our team
+
+Rules: use only facts that appear in the thread. Never invent. Be brief.
+
+THREAD:
+{thread}"""
+    try:
+        msg = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=700,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        txt = msg.content[0].text.strip()
+        sec = {"STATUS": "", "SUMMARY": "", "KEY DETAILS": "", "NEXT STEP": ""}
+        current = None
+        for line in txt.splitlines():
+            m = re.match(r"^\s*(STATUS|SUMMARY|KEY DETAILS|NEXT STEP)\s*:\s*(.*)$", line, re.I)
+            if m:
+                current = m.group(1).upper()
+                sec[current] = m.group(2).strip()
+            elif current:
+                sec[current] += ("\n" if sec[current] else "") + line.rstrip()
+        out["status"] = sec["STATUS"].strip()
+        out["summary"] = sec["SUMMARY"].strip()
+        out["details"] = [l.strip().lstrip("-").strip() for l in sec["KEY DETAILS"].splitlines() if l.strip()]
+        out["next_step"] = sec["NEXT STEP"].strip()
+    except Exception as e:
+        print(f"[summary] Claude failed: {e}")
+    return out
+
+
+def build_summary_note(lead_email: str, campaign_name: str, sentiment: str, mailbox: str,
+                       messages: list, ai: dict, inbox_link: str = "") -> tuple:
+    inbound = [m for m in messages if m["dir"] == "inbound"]
+    last = messages[-1] if messages else None
+    now = datetime.now(timezone.utc)
+    title = f"{SUMMARY_NOTE_TITLE} - {campaign_name or 'Smartlead'} ({sentiment}) - updated {now.strftime('%b %d, %Y %H:%M')} UTC"
+
+    lines = [
+        f"Status: {ai.get('status') or '-'}",
+        f"Sentiment: {sentiment} (latest reply)",
+        f"Campaign: {campaign_name or '-'}",
+        f"Lead: {lead_email}",
+        f"Our mailbox: {mailbox or '-'}",
+        f"Messages: {len(messages)} ({len(inbound)} from lead)",
+        f"Last message: {_fmt_time(last['time']) if last else '-'}" + (f" ({last['dir']})" if last else ""),
+    ]
+    if inbox_link:
+        lines.append(f"Smartlead thread: {inbox_link}")
+    lines += ["", "SUMMARY", ai.get("summary") or "(summary unavailable)", "", "KEY DETAILS"]
+    lines += [f"- {d}" for d in (ai.get("details") or ["none"])]
+    lines += ["", "NEXT STEP", ai.get("next_step") or "-", "", "TIMELINE"]
+    for m in messages:
+        who = "Lead" if m["dir"] == "inbound" else (m["who"] or "Hitch")
+        label = f"{who} ({m['dir']}{', ' + m['kind'] if m.get('kind') else ''})"
+        body = re.sub(r"\s+", " ", m["text"]).strip()
+        limit = 200 if m.get("kind") == "campaign email" else 400
+        if len(body) > limit:
+            body = body[:limit].rstrip() + "..."
+        lines.append(f"{_fmt_time(m['time'])} - {label}: {body}")
+    return title[:200], "\n".join(lines)
+
+
+def replace_summary_note(parent_object: str, record_id: str, title: str, content: str) -> None:
+    """Delete any earlier summary note on this record, then create the new one."""
+    try:
+        notes = _attio("GET", "/notes", params={"parent_object": parent_object,
+                                              "parent_record_id": record_id, "limit": 50}).get("data", [])
+        for n in notes:
+            if str(n.get("title", "")).startswith(SUMMARY_NOTE_TITLE):
+                nid = n.get("id", {}).get("note_id")
+                if nid:
+                    _attio("DELETE", f"/notes/{nid}")
+    except Exception as e:
+        print(f"[attio] Could not clear old summary notes on {parent_object}/{record_id}: {e}")
+    add_attio_note(parent_object, record_id, title, content)
+
+
+def refresh_conversation(lead_email: str, campaign_id, lead_id, campaign_name: str, sentiment: str,
+                         person_id: str, deal_id: str = None, pending: dict = None,
+                         inbox_link: str = "") -> str:
+    """
+    Rebuild the living 'Conversation summary' note from the Smartlead thread and
+    put it on the person (and deal). `pending` is a message we just sent that may
+    not be in Smartlead's history yet. Returns a short status string.
+    """
+    mailbox, messages = "", []
+    if campaign_id and lead_id and SMARTLEAD_API_KEY:
+        try:
+            mailbox, messages = fetch_thread_messages(campaign_id, lead_id)
+        except Exception as e:
+            print(f"[attio] Thread fetch failed: {e}")
+    if pending:
+        head = re.sub(r"\s+", " ", pending.get("text", ""))[:60]
+        if not any(head and head in re.sub(r"\s+", " ", m["text"]) for m in messages):
+            messages.append(pending)
+            messages.sort(key=lambda x: str(x.get("time", "")))
+    if not messages:
+        return "no thread"
+    ai = summarize_conversation(messages, campaign_name, lead_email)
+    title, content = build_summary_note(lead_email, campaign_name, sentiment, mailbox, messages, ai, inbox_link)
+    targets = []
+    if person_id:
+        replace_summary_note("people", person_id, title, content)
+        targets.append("person")
+    if deal_id:
+        replace_summary_note("deals", deal_id, title, content)
+        targets.append("deal")
+    return "summary on " + "+".join(targets) if targets else "no target"
+
+
+def _latest_sentiment(person_id: str) -> str:
+    """Read the person's current Reply status so outbound updates keep it."""
+    try:
+        rec = _attio("GET", f"/objects/people/records/{person_id}")
+        vals = rec.get("data", {}).get("values", {}).get(REPLY_STATUS_SLUG, [])
+        return (vals[0].get("option", {}) or {}).get("title", "") if vals else ""
+    except Exception:
+        return ""
+
+
+def log_outbound_to_attio(lead_email: str, author: str, text: str, when: str = "",
+                          campaign_name: str = "", via: str = "",
+                          campaign_id=None, lead_id=None, inbox_link: str = "") -> dict:
+    """
+    An email WE sent to the lead (bot reply or a teammate's manual email):
+    refresh the conversation summary on the person and deal. Never raises.
     """
     if not ATTIO_API_KEY or not lead_email:
         return {"ok": False, "summary": "Attio: not configured"}
     try:
         person_id = _record_id(upsert_attio_person(lead_email))
-        title = f"Outbound email from {author or 'Hitch team'}" + (f" - {campaign_name}" if campaign_name else "")
-        body = (
-            f"Direction: outbound\n"
-            f"From: {author or 'Hitch team'}\n"
-            f"To: {lead_email}\n"
-            f"Sent: {when or '-'}\n"
-            f"Via: {via or '-'}\n\n"
-            f"{_trim_quoted(text)}"
-        )
-        done = []
-        note_at = _iso(when)
-        if person_id:
-            add_attio_note("people", person_id, title, body, created_at=note_at)
-            done.append("person note")
-            deal_id = find_attio_deal_for_person(person_id, lead_email)
-            if deal_id:
-                add_attio_note("deals", deal_id, title, body, created_at=note_at)
-                done.append("deal note")
-        summary = "Attio: logged outbound (" + ", ".join(done) + ")"
-        print(f"[attio] {summary} for {lead_email} from {author}")
+        deal_id = find_attio_deal_for_person(person_id, lead_email)
+        sentiment = _latest_sentiment(person_id) or "Neutral"
+        pending = {"dir": "outbound", "who": author or "Hitch team", "time": when or datetime.now(timezone.utc).isoformat(),
+                   "text": _trim_quoted(text), "kind": ""}
+        res = refresh_conversation(lead_email, campaign_id, lead_id, campaign_name, sentiment,
+                                   person_id, deal_id, pending=pending, inbox_link=inbox_link)
+        summary = f"Attio: outbound logged ({res})"
+        print(f"[attio] {summary} for {lead_email} from {author} via {via}")
         return {"ok": True, "summary": summary}
     except Exception as e:
         print(f"[attio] Outbound log FAILED for {lead_email}: {e}")
@@ -604,28 +766,18 @@ def log_outbound_to_attio(lead_email: str, author: str, text: str, when: str = "
 
 
 def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
-                  lead_response: str = "", reply_time: str = "", sender: str = "") -> dict:
+                  lead_response: str = "", reply_time: str = "", sender: str = "",
+                  campaign_id=None, lead_id=None, inbox_link: str = "") -> dict:
     """
-    For EVERY real lead reply: upsert company + person, set the person's
-    Reply status (Positive/Negative/Neutral) and add a note with the reply text.
-    For Positive replies only: also create a deal (owner Devon by default) linked
-    to the person + company, with the same note on the deal.
+    For EVERY real lead reply: upsert company + person, set Reply status on both,
+    create a deal for Positive replies (reused if one exists), then rebuild the
+    single living 'Conversation summary' note on the person and deal.
     Never raises -- Attio problems must not block Slack.
     """
     if not ATTIO_API_KEY:
         return {"ok": False, "summary": "Attio: not configured", "deal_id": None}
 
     domain = lead_email.split("@", 1)[1] if "@" in lead_email else ""
-    note_title = f"Inbound reply ({sentiment})" + (f" - {campaign_name}" if campaign_name else "")
-    note_body = (
-        f"Direction: inbound\n"
-        f"Sentiment: {sentiment}\n"
-        f"Campaign: {campaign_name or '-'}\n"
-        f"Lead: {lead_email}\n"
-        f"Replied to: {sender or '-'}\n"
-        f"Received: {reply_time or '-'}\n\n"
-        f"{(lead_response or '').strip()}"
-    )
     done, step = [], "reply status field"
     try:
         ensure_reply_status_attribute()
@@ -639,17 +791,12 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         person_id = _record_id(upsert_attio_person(lead_email, sentiment))
         done.append(f"person ({sentiment})")
 
-        note_at = _iso(reply_time)
-        step = "note"
-        if person_id:
-            add_attio_note("people", person_id, note_title, note_body, created_at=note_at)
-            done.append("note")
-
         deal_id = None
+        step = "deal"
+        existing = find_attio_deal_for_person(person_id, lead_email)
         if sentiment == "Positive":
-            step = "deal"
-            deal_id = find_attio_deal_for_person(person_id, lead_email)
-            if deal_id:
+            if existing:
+                deal_id = existing
                 try:
                     link_attio_deal(deal_id, person_id, company_id)
                 except Exception as e:
@@ -658,16 +805,14 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             else:
                 deal_id = _record_id(create_attio_deal(lead_email, campaign_name, person_id, company_id))
                 done.append("new deal")
-            if deal_id:
-                step = "deal note"
-                add_attio_note("deals", deal_id, note_title, note_body, created_at=note_at)
         else:
-            # Negative/Neutral: still keep the deal's history complete if one exists
-            step = "deal note"
-            existing = find_attio_deal_for_person(person_id, lead_email)
-            if existing:
-                add_attio_note("deals", existing, note_title, note_body, created_at=note_at)
-                done.append("deal note")
+            deal_id = existing
+
+        step = "summary note"
+        pending = {"dir": "inbound", "who": lead_email, "time": reply_time, "text": lead_response or "", "kind": ""}
+        res = refresh_conversation(lead_email, campaign_id, lead_id, campaign_name, sentiment,
+                                   person_id, deal_id, pending=pending, inbox_link=inbox_link)
+        done.append(res)
 
         summary = "Attio: synced " + " + ".join(done)
         print(f"[attio] {summary} for {lead_email} deal_id={deal_id}")
@@ -995,7 +1140,9 @@ def incoming_reply():
         print(f"[incoming] Outbound message by {author} ({outbound_reason}); logging to Attio, no Slack card")
         logged = log_outbound_to_attio(
             lead_email, author, reply_snippet or _strip_html(reply_html), reply_time,
-            campaign_name, via="manual email (seen by Smartlead)")
+            campaign_name, via="manual email (seen by Smartlead)",
+            campaign_id=campaign_id, lead_id=lead_id,
+            inbox_link=body.get("ui_master_inbox_link") or body.get("app_url", ""))
         return jsonify({"status": "logged_outbound", "reason": outbound_reason,
                         "author": author, "attio": logged["summary"]}), 200
 
@@ -1010,7 +1157,9 @@ def incoming_reply():
     # Step 3b: Sentiment label for the Slack card
     sentiment = classify_sentiment(lead_response, campaign_name)
     attio = sync_to_attio(lead_email, sentiment, campaign_name,
-                          lead_response=lead_response, reply_time=reply_time, sender=eaccount)
+                          lead_response=lead_response, reply_time=reply_time, sender=eaccount,
+                          campaign_id=campaign_id, lead_id=lead_id,
+                          inbox_link=body.get("ui_master_inbox_link") or body.get("app_url", ""))
 
     # Step 4: Claude draft
     # Calendly slot fetching disabled for now:
@@ -1175,7 +1324,8 @@ def slack_actions():
             result = _send_from_meta(meta, draft)
             print(f"[send_reply] Smartlead response: {result}")
             log_outbound_to_attio(lead_email, clean_slack_email(meta.get("eaccount", "")), draft,
-                                  datetime.now(timezone.utc).isoformat(), via="Slack bot (Send reply)")
+                                  datetime.now(timezone.utc).isoformat(), via="Slack bot (Send reply)",
+                                  campaign_id=meta.get("campaign_id"), lead_id=meta.get("lead_id"))
             if response_url:
                 requests.post(response_url, json={
                     "replace_original": "true",
@@ -1302,7 +1452,8 @@ def slack_events():
         result = _send_from_meta(meta, reply_text)
         print(f"[edit_send] Smartlead response: {result}")
         log_outbound_to_attio(lead_email, clean_slack_email(meta.get("eaccount", "")), reply_text,
-                              datetime.now(timezone.utc).isoformat(), via="Slack bot (Edit & send)")
+                              datetime.now(timezone.utc).isoformat(), via="Slack bot (Edit & send)",
+                              campaign_id=meta.get("campaign_id"), lead_id=meta.get("lead_id"))
         post_slack_chat(channel, thread_ts, f"✅ Reply sent to {lead_email}")
     except Exception as e:
         _sent_replies.discard(dedup_key)
@@ -1425,6 +1576,14 @@ def attio_lookup():
             out["deals_by_name_error"] = e.response.text[:300] if e.response is not None else str(e)
         notes = _attio("GET", "/notes", params={"parent_object": "people", "parent_record_id": pid, "limit": 20}).get("data", [])
         out["notes"] = [{"title": n.get("title"), "created_at": n.get("created_at")} for n in notes]
+        for n in notes:
+            if str(n.get("title", "")).startswith(SUMMARY_NOTE_TITLE):
+                try:
+                    full = _attio("GET", f"/notes/{n['id']['note_id']}").get("data", {})
+                    out["summary_note"] = full.get("content_plaintext") or full.get("content") or ""
+                except Exception as e:
+                    out["summary_note_error"] = str(e)[:200]
+                break
     except requests.HTTPError as e:
         out["ok"] = False
         out["error"] = (e.response.text[:300] if e.response is not None else str(e))
@@ -1437,8 +1596,11 @@ def attio_lookup():
 @app.route("/attio/backfill", methods=["GET", "POST"])
 def attio_backfill():
     """
-    One-off: replay a lead's Smartlead thread into Attio (from their first reply
-    onward). Requires ?email=...&confirm=yes. Skips notes that already exist.
+    One-off: rebuild a lead's Attio state from their Smartlead thread.
+    Sets Reply status from their latest reply, creates/links the deal if
+    Positive, and writes the living Conversation summary note.
+    ?email=...&confirm=yes   plus optional &cleanup=yes to delete old per-message
+    bot notes ("Inbound reply ..." / "Outbound email ...").
     """
     if not ATTIO_API_KEY or not SMARTLEAD_API_KEY:
         return jsonify({"ok": False, "error": "ATTIO_API_KEY / SMARTLEAD_API_KEY not set"}), 200
@@ -1455,52 +1617,43 @@ def attio_backfill():
     except Exception as e:
         return jsonify({"ok": False, "error": f"smartlead lookup: {e}"}), 200
 
-    # Existing notes on the person, to avoid duplicates on re-run
-    existing = set()
-    try:
-        q = _attio("POST", "/objects/people/records/query", json={"filter": {"email_addresses": email}, "limit": 1})
-        rows = q.get("data", [])
-        if rows:
-            pid = rows[0]["id"]["record_id"]
-            for n in _attio("GET", "/notes", params={"parent_object": "people", "parent_record_id": pid, "limit": 50}).get("data", []):
-                existing.add((n.get("title"), (n.get("created_at") or "")[:19]))
-    except Exception as e:
-        print(f"[backfill] note pre-check failed: {e}")
-
     results = []
     for camp in campaigns:
         cid, cname = camp.get("campaign_id"), camp.get("campaign_name", "")
         try:
-            hist = requests.get(f"{SMARTLEAD_BASE}/campaigns/{cid}/leads/{lead_id}/message-history",
-                                params={"api_key": SMARTLEAD_API_KEY}, timeout=20).json()
+            mailbox, messages = fetch_thread_messages(cid, lead_id)
         except Exception as e:
             results.append({"campaign": cname, "error": str(e)}); continue
-        history = hist.get("history", []) if isinstance(hist, dict) else []
-        mailbox = hist.get("from", "") if isinstance(hist, dict) else ""
-        seen_reply = False
-        for m in history:
-            author = _bare_email(m.get("from"))
-            when = m.get("time", "")
-            html = m.get("email_body") or ""
-            text = _strip_html(html)
-            key_time = (_iso(when) or "")[:19]
-            if not is_own_address(author):
-                seen_reply = True
-                lead_response = extract_lead_response(html, _trim_quoted(text), cname)
-                sentiment = classify_sentiment(lead_response, cname)
-                title = f"Inbound reply ({sentiment})" + (f" - {cname}" if cname else "")
-                if (title, key_time) in existing:
-                    results.append({"time": when, "dir": "inbound", "skipped": "already logged"}); continue
-                r = sync_to_attio(email, sentiment, cname, lead_response=lead_response,
-                                  reply_time=when, sender=mailbox)
-                results.append({"time": when, "dir": "inbound", "sentiment": sentiment, "attio": r["summary"]})
-            elif seen_reply:
-                title = f"Outbound email from {author}" + (f" - {cname}" if cname else "")
-                if (title, key_time) in existing:
-                    results.append({"time": when, "dir": "outbound", "skipped": "already logged"}); continue
-                r = log_outbound_to_attio(email, author, text, when, cname, via="backfill from Smartlead history")
-                results.append({"time": when, "dir": "outbound", "from": author, "attio": r["summary"]})
-    return jsonify({"ok": True, "email": email, "events": results}), 200
+        inbound = [m for m in messages if m["dir"] == "inbound"]
+        if not inbound:
+            results.append({"campaign": cname, "skipped": "no reply from lead"}); continue
+        latest = inbound[-1]
+        lead_response = latest["text"]
+        sentiment = classify_sentiment(lead_response, cname)
+        r = sync_to_attio(email, sentiment, cname, lead_response=lead_response, reply_time=latest["time"],
+                          sender=mailbox, campaign_id=cid, lead_id=lead_id)
+        results.append({"campaign": cname, "messages": len(messages), "replies": len(inbound),
+                        "latest_sentiment": sentiment, "attio": r["summary"]})
+
+    removed = 0
+    if request.args.get("cleanup") == "yes":
+        try:
+            q = _attio("POST", "/objects/people/records/query", json={"filter": {"email_addresses": email}, "limit": 1})
+            rows = q.get("data", [])
+            pid = rows[0]["id"]["record_id"] if rows else None
+            targets = [("people", pid)] if pid else []
+            did = find_attio_deal_for_person(pid, email) if pid else None
+            if did:
+                targets.append(("deals", did))
+            for obj, rid in targets:
+                for n in _attio("GET", "/notes", params={"parent_object": obj, "parent_record_id": rid, "limit": 50}).get("data", []):
+                    t = str(n.get("title", ""))
+                    if t.startswith("Inbound reply (") or t.startswith("Outbound email from "):
+                        _attio("DELETE", f"/notes/{n['id']['note_id']}")
+                        removed += 1
+        except Exception as e:
+            results.append({"cleanup_error": str(e)[:200]})
+    return jsonify({"ok": True, "email": email, "events": results, "old_notes_removed": removed}), 200
 
 
 @app.route("/attio/setup", methods=["GET", "POST"])
