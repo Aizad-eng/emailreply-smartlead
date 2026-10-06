@@ -1344,7 +1344,23 @@ def attio_lookup():
             "reply_status": [v.get("option", {}).get("title") for v in vals.get(REPLY_STATUS_SLUG, [])],
             "created_at": p.get("created_at"),
         }
-        out["deal_id"] = find_attio_deal_for_person(pid)
+        try:
+            q = _attio("POST", "/objects/deals/records/query", json={
+                "filter": {"associated_people": {"target_object": "people", "target_record_id": pid}},
+                "limit": 5})
+            out["deals_linked"] = [{"id": d.get("id", {}).get("record_id"),
+                                    "name": [v.get("value") for v in d.get("values", {}).get("name", [])],
+                                    "created_at": d.get("created_at")} for d in q.get("data", [])]
+        except requests.HTTPError as e:
+            out["deals_linked_error"] = e.response.text[:300] if e.response is not None else str(e)
+        try:
+            q = _attio("POST", "/objects/deals/records/query", json={
+                "filter": {"name": {"$contains": email}}, "limit": 5})
+            out["deals_by_name"] = [{"id": d.get("id", {}).get("record_id"),
+                                     "name": [v.get("value") for v in d.get("values", {}).get("name", [])],
+                                     "created_at": d.get("created_at")} for d in q.get("data", [])]
+        except requests.HTTPError as e:
+            out["deals_by_name_error"] = e.response.text[:300] if e.response is not None else str(e)
         notes = _attio("GET", "/notes", params={"parent_object": "people", "parent_record_id": pid, "limit": 20}).get("data", [])
         out["notes"] = [{"title": n.get("title"), "created_at": n.get("created_at")} for n in notes]
     except requests.HTTPError as e:
