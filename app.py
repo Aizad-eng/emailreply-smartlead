@@ -423,41 +423,47 @@ def _record_id(record: dict):
     return (record or {}).get("data", {}).get("id", {}).get("record_id")
 
 
+REPLY_STATUS_OBJECTS = ("people", "companies")
+
+
 def ensure_reply_status_attribute() -> dict:
     """
-    Make sure People has a 'Reply status' select attribute with
+    Make sure People AND Companies have a 'Reply status' select attribute with
     Positive / Negative / Neutral options. Idempotent; result is cached.
     """
     if _reply_status_ready["ok"]:
-        return {"ok": True, "created": False}
-    attrs = _attio("GET", "/objects/people/attributes").get("data", [])
-    exists = any(a.get("api_slug") == REPLY_STATUS_SLUG for a in attrs)
-    created = False
-    if not exists:
-        _attio("POST", "/objects/people/attributes", json={"data": {
-            "title": "Reply status",
-            "description": "Sentiment of the latest email reply, set by the Smartlead reply bot",
-            "api_slug": REPLY_STATUS_SLUG,
-            "type": "select",
-            "is_required": False,
-            "is_unique": False,
-            "is_multiselect": False,
-            "config": {},
-        }})
-        created = True
-    existing = {o.get("title") for o in
-                _attio("GET", f"/objects/people/attributes/{REPLY_STATUS_SLUG}/options").get("data", [])}
-    for title in REPLY_STATUS_OPTIONS:
-        if title not in existing:
-            _attio("POST", f"/objects/people/attributes/{REPLY_STATUS_SLUG}/options",
-                   json={"data": {"title": title}})
+        return {"ok": True, "created": []}
+    created = []
+    for obj in REPLY_STATUS_OBJECTS:
+        attrs = _attio("GET", f"/objects/{obj}/attributes").get("data", [])
+        if not any(a.get("api_slug") == REPLY_STATUS_SLUG for a in attrs):
+            _attio("POST", f"/objects/{obj}/attributes", json={"data": {
+                "title": "Reply status",
+                "description": "Sentiment of the latest email reply, set by the Smartlead reply bot",
+                "api_slug": REPLY_STATUS_SLUG,
+                "type": "select",
+                "is_required": False,
+                "is_unique": False,
+                "is_multiselect": False,
+                "config": {},
+            }})
+            created.append(obj)
+        existing = {o.get("title") for o in
+                    _attio("GET", f"/objects/{obj}/attributes/{REPLY_STATUS_SLUG}/options").get("data", [])}
+        for title in REPLY_STATUS_OPTIONS:
+            if title not in existing:
+                _attio("POST", f"/objects/{obj}/attributes/{REPLY_STATUS_SLUG}/options",
+                       json={"data": {"title": title}})
     _reply_status_ready["ok"] = True
     return {"ok": True, "created": created}
 
 
-def upsert_attio_company(domain: str) -> dict:
+def upsert_attio_company(domain: str, sentiment: str = "") -> dict:
+    values = {"domains": [{"domain": domain}]}
+    if sentiment in REPLY_STATUS_OPTIONS:
+        values[REPLY_STATUS_SLUG] = [{"option": sentiment}]
     return _attio("PUT", "/objects/companies/records", params={"matching_attribute": "domains"},
-                  json={"data": {"values": {"domains": [{"domain": domain}]}}})
+                  json={"data": {"values": values}})
 
 
 def upsert_attio_person(lead_email: str, sentiment: str = "") -> dict:
@@ -484,14 +490,42 @@ def create_attio_deal(lead_email: str, campaign_name: str = "",
     return _attio("POST", "/objects/deals/records", json={"data": {"values": values}})
 
 
-def add_attio_note(parent_object: str, record_id: str, title: str, content: str) -> dict:
-    return _attio("POST", "/notes", json={"data": {
+def add_attio_note(parent_object: str, record_id: str, title: str, content: str,
+                   created_at: str = None) -> dict:
+    data = {
         "parent_object": parent_object,
         "parent_record_id": record_id,
         "title": title[:200],
         "format": "plaintext",
         "content": content,
-    }})
+    }
+    if created_at:
+        data["created_at"] = created_at
+    return _attio("POST", "/notes", json={"data": data})
+
+
+def link_attio_deal(deal_id: str, person_id: str = None, company_id: str = None) -> None:
+    """Attach person/company to a deal (PATCH appends to record-reference attributes)."""
+    values = {}
+    if person_id:
+        values["associated_people"] = [{"target_object": "people", "target_record_id": person_id}]
+    if company_id:
+        values["associated_company"] = [{"target_object": "companies", "target_record_id": company_id}]
+    if values:
+        _attio("PATCH", f"/objects/deals/records/{deal_id}", json={"data": {"values": values}})
+
+
+def _iso(ts: str):
+    """Normalise a Smartlead/ISO timestamp for Attio's created_at."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    except Exception:
+        return None
 
 
 def find_attio_deal_for_person(person_id: str, lead_email: str = ""):
@@ -553,12 +587,13 @@ def log_outbound_to_attio(lead_email: str, author: str, text: str, when: str = "
             f"{_trim_quoted(text)}"
         )
         done = []
+        note_at = _iso(when)
         if person_id:
-            add_attio_note("people", person_id, title, body)
+            add_attio_note("people", person_id, title, body, created_at=note_at)
             done.append("person note")
             deal_id = find_attio_deal_for_person(person_id, lead_email)
             if deal_id:
-                add_attio_note("deals", deal_id, title, body)
+                add_attio_note("deals", deal_id, title, body, created_at=note_at)
                 done.append("deal note")
         summary = "Attio: logged outbound (" + ", ".join(done) + ")"
         print(f"[attio] {summary} for {lead_email} from {author}")
@@ -596,17 +631,18 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         ensure_reply_status_attribute()
 
         step = "company"
-        company_id = _record_id(upsert_attio_company(domain)) if domain else None
+        company_id = _record_id(upsert_attio_company(domain, sentiment)) if domain else None
         if company_id:
-            done.append("company")
+            done.append(f"company ({sentiment})")
 
         step = "person"
         person_id = _record_id(upsert_attio_person(lead_email, sentiment))
         done.append(f"person ({sentiment})")
 
+        note_at = _iso(reply_time)
         step = "note"
         if person_id:
-            add_attio_note("people", person_id, note_title, note_body)
+            add_attio_note("people", person_id, note_title, note_body, created_at=note_at)
             done.append("note")
 
         deal_id = None
@@ -614,19 +650,23 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             step = "deal"
             deal_id = find_attio_deal_for_person(person_id, lead_email)
             if deal_id:
+                try:
+                    link_attio_deal(deal_id, person_id, company_id)
+                except Exception as e:
+                    print(f"[attio] Could not link existing deal {deal_id}: {e}")
                 done.append("existing deal")
             else:
                 deal_id = _record_id(create_attio_deal(lead_email, campaign_name, person_id, company_id))
                 done.append("new deal")
             if deal_id:
                 step = "deal note"
-                add_attio_note("deals", deal_id, note_title, note_body)
+                add_attio_note("deals", deal_id, note_title, note_body, created_at=note_at)
         else:
             # Negative/Neutral: still keep the deal's history complete if one exists
             step = "deal note"
             existing = find_attio_deal_for_person(person_id, lead_email)
             if existing:
-                add_attio_note("deals", existing, note_title, note_body)
+                add_attio_note("deals", existing, note_title, note_body, created_at=note_at)
                 done.append("deal note")
 
         summary = "Attio: synced " + " + ".join(done)
@@ -1316,15 +1356,15 @@ def attio_check():
     except Exception as e:
         out["members_error"] = str(e)[:300]
     try:
-        attrs = _attio("GET", "/objects/people/attributes").get("data", [])
-        out["reply_status_attribute"] = any(a.get("api_slug") == REPLY_STATUS_SLUG for a in attrs)
-        if out["reply_status_attribute"]:
-            out["reply_status_options"] = [o.get("title") for o in
-                _attio("GET", f"/objects/people/attributes/{REPLY_STATUS_SLUG}/options").get("data", [])]
+        out["reply_status_attribute"] = {}
+        for obj in REPLY_STATUS_OBJECTS:
+            attrs = _attio("GET", f"/objects/{obj}/attributes").get("data", [])
+            out["reply_status_attribute"][obj] = any(a.get("api_slug") == REPLY_STATUS_SLUG for a in attrs)
+        out["reply_status_attribute_all"] = all(out["reply_status_attribute"].values())
     except Exception as e:
         out["reply_status_error"] = str(e)[:300]
     out["ok"] = (out.get("scopes_ok", False) and out.get("has_deals_object", False)
-                 and out.get("deal_stage_valid", False) and out.get("reply_status_attribute", False))
+                 and out.get("deal_stage_valid", False) and out.get("reply_status_attribute_all", False))
     return jsonify(out), 200
 
 
@@ -1353,6 +1393,19 @@ def attio_lookup():
             "reply_status": [v.get("option", {}).get("title") for v in vals.get(REPLY_STATUS_SLUG, [])],
             "created_at": p.get("created_at"),
         }
+        domain = email.split("@", 1)[1]
+        try:
+            cq = _attio("POST", "/objects/companies/records/query", json={"filter": {"domains": domain}, "limit": 1})
+            crow = (cq.get("data") or [None])[0]
+            if crow:
+                cv = crow.get("values", {})
+                out["company"] = {
+                    "record_id": crow.get("id", {}).get("record_id"),
+                    "name": [v.get("value") for v in cv.get("name", [])],
+                    "reply_status": [v.get("option", {}).get("title") for v in cv.get(REPLY_STATUS_SLUG, [])],
+                }
+        except Exception as e:
+            out["company_error"] = str(e)[:200]
         try:
             q = _attio("POST", "/objects/deals/records/query", json={
                 "filter": {"associated_people": {"target_object": "people", "target_record_id": pid}},
@@ -1379,6 +1432,75 @@ def attio_lookup():
         out["ok"] = False
         out["error"] = str(e)[:300]
     return jsonify(out), 200
+
+
+@app.route("/attio/backfill", methods=["GET", "POST"])
+def attio_backfill():
+    """
+    One-off: replay a lead's Smartlead thread into Attio (from their first reply
+    onward). Requires ?email=...&confirm=yes. Skips notes that already exist.
+    """
+    if not ATTIO_API_KEY or not SMARTLEAD_API_KEY:
+        return jsonify({"ok": False, "error": "ATTIO_API_KEY / SMARTLEAD_API_KEY not set"}), 200
+    email = _bare_email(request.args.get("email", ""))
+    if not email or request.args.get("confirm") != "yes":
+        return jsonify({"ok": False, "error": "pass ?email=...&confirm=yes"}), 200
+    try:
+        lead = requests.get(f"{SMARTLEAD_BASE}/leads/", params={"api_key": SMARTLEAD_API_KEY, "email": email},
+                            timeout=20).json()
+        lead_id = lead.get("id")
+        campaigns = lead.get("lead_campaign_data", [])
+        if not lead_id or not campaigns:
+            return jsonify({"ok": False, "error": "lead not found in Smartlead"}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"smartlead lookup: {e}"}), 200
+
+    # Existing notes on the person, to avoid duplicates on re-run
+    existing = set()
+    try:
+        q = _attio("POST", "/objects/people/records/query", json={"filter": {"email_addresses": email}, "limit": 1})
+        rows = q.get("data", [])
+        if rows:
+            pid = rows[0]["id"]["record_id"]
+            for n in _attio("GET", "/notes", params={"parent_object": "people", "parent_record_id": pid, "limit": 50}).get("data", []):
+                existing.add((n.get("title"), (n.get("created_at") or "")[:19]))
+    except Exception as e:
+        print(f"[backfill] note pre-check failed: {e}")
+
+    results = []
+    for camp in campaigns:
+        cid, cname = camp.get("campaign_id"), camp.get("campaign_name", "")
+        try:
+            hist = requests.get(f"{SMARTLEAD_BASE}/campaigns/{cid}/leads/{lead_id}/message-history",
+                                params={"api_key": SMARTLEAD_API_KEY}, timeout=20).json()
+        except Exception as e:
+            results.append({"campaign": cname, "error": str(e)}); continue
+        history = hist.get("history", []) if isinstance(hist, dict) else []
+        mailbox = hist.get("from", "") if isinstance(hist, dict) else ""
+        seen_reply = False
+        for m in history:
+            author = _bare_email(m.get("from"))
+            when = m.get("time", "")
+            html = m.get("email_body") or ""
+            text = _strip_html(html)
+            key_time = (_iso(when) or "")[:19]
+            if not is_own_address(author):
+                seen_reply = True
+                lead_response = extract_lead_response(html, _trim_quoted(text), cname)
+                sentiment = classify_sentiment(lead_response, cname)
+                title = f"Inbound reply ({sentiment})" + (f" - {cname}" if cname else "")
+                if (title, key_time) in existing:
+                    results.append({"time": when, "dir": "inbound", "skipped": "already logged"}); continue
+                r = sync_to_attio(email, sentiment, cname, lead_response=lead_response,
+                                  reply_time=when, sender=mailbox)
+                results.append({"time": when, "dir": "inbound", "sentiment": sentiment, "attio": r["summary"]})
+            elif seen_reply:
+                title = f"Outbound email from {author}" + (f" - {cname}" if cname else "")
+                if (title, key_time) in existing:
+                    results.append({"time": when, "dir": "outbound", "skipped": "already logged"}); continue
+                r = log_outbound_to_attio(email, author, text, when, cname, via="backfill from Smartlead history")
+                results.append({"time": when, "dir": "outbound", "from": author, "attio": r["summary"]})
+    return jsonify({"ok": True, "email": email, "events": results}), 200
 
 
 @app.route("/attio/setup", methods=["GET", "POST"])
