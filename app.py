@@ -567,6 +567,15 @@ def _trim_quoted(text: str) -> str:
     return text[:cut].strip()
 
 
+def _trim_signature(text: str) -> str:
+    """Drop everything from a sign-off line onward (for compact timeline entries)."""
+    if not text:
+        return ""
+    m = re.search(r"(?:^|\n)\s*(best regards|kind regards|warm regards|regards|best|thanks|thank you|cheers|sincerely|all the best)\s*[,!.]?\s*(?:\n|$)",
+                  text, re.I)
+    return text[:m.start()].strip() if m and m.start() > 0 else text.strip()
+
+
 SUMMARY_NOTE_TITLE = "Conversation summary"
 
 
@@ -674,7 +683,7 @@ def build_summary_note(lead_email: str, campaign_name: str, sentiment: str, mail
     for m in messages:
         who = "Lead" if m["dir"] == "inbound" else (m["who"] or "Hitch")
         label = f"{who} ({m['dir']}{', ' + m['kind'] if m.get('kind') else ''})"
-        body = re.sub(r"\s+", " ", m["text"]).strip()
+        body = re.sub(r"\s+", " ", _trim_signature(m["text"])).strip()
         limit = 200 if m.get("kind") == "campaign email" else 400
         if len(body) > limit:
             body = body[:limit].rstrip() + "..."
@@ -870,6 +879,7 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
     text = re.sub(r"</p>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
+    text = html_lib.unescape(text).replace("\xa0", " ")
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
