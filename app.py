@@ -1709,6 +1709,51 @@ def attio_backfill():
     return jsonify({"ok": True, "email": email, "events": results, "old_notes_removed": removed}), 200
 
 
+@app.route("/attio/inspect", methods=["GET"])
+def attio_inspect():
+    """Read-only: ?object=deals lists attributes (+ options/statuses); &record=<id> dumps one record."""
+    if not ATTIO_API_KEY:
+        return jsonify({"ok": False, "error": "ATTIO_API_KEY is not set"}), 200
+    obj = request.args.get("object", "deals")
+    rid = request.args.get("record")
+    out = {"ok": True, "object": obj}
+    try:
+        if rid:
+            rec = _attio("GET", f"/objects/{obj}/records/{rid}").get("data", {})
+            out["record"] = {"id": rec.get("id"), "values": rec.get("values")}
+            return jsonify(out), 200
+        if obj == "objects":
+            out["objects"] = [{"slug": o.get("api_slug"), "singular": o.get("singular_noun")} for o in
+                              _attio("GET", "/objects").get("data", [])]
+            return jsonify(out), 200
+        attrs = _attio("GET", f"/objects/{obj}/attributes").get("data", [])
+        rows = []
+        for a in attrs:
+            row = {"slug": a.get("api_slug"), "title": a.get("title"), "type": a.get("type"),
+                   "multi": a.get("is_multiselect"), "required": a.get("is_required"),
+                   "system": a.get("is_system_attribute")}
+            if a.get("type") == "record-reference":
+                row["targets"] = [t.get("target_object") for t in (a.get("relationship") or {}).get("allowed_record_objects", [])] \
+                    if isinstance(a.get("relationship"), dict) else (a.get("config", {}) or {}).get("record_reference", {}).get("allowed_object_ids")
+            if a.get("type") == "select":
+                try:
+                    row["options"] = [o.get("title") for o in _attio("GET", f"/objects/{obj}/attributes/{a['api_slug']}/options").get("data", [])]
+                except Exception as e:
+                    row["options_error"] = str(e)[:100]
+            if a.get("type") == "status":
+                try:
+                    row["statuses"] = [s.get("title") for s in _attio("GET", f"/objects/{obj}/attributes/{a['api_slug']}/statuses").get("data", [])]
+                except Exception as e:
+                    row["statuses_error"] = str(e)[:100]
+            rows.append(row)
+        out["attributes"] = rows
+    except requests.HTTPError as e:
+        out["ok"] = False; out["error"] = e.response.text[:300] if e.response is not None else str(e)
+    except Exception as e:
+        out["ok"] = False; out["error"] = str(e)[:300]
+    return jsonify(out), 200
+
+
 @app.route("/attio/setup", methods=["GET", "POST"])
 def attio_setup():
     """One-off: create the People 'Reply status' select attribute if missing."""
