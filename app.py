@@ -569,6 +569,62 @@ def ensure_person_email(person_id: str, extra_email: str) -> bool:
         return False
 
 
+def smartlead_lead_profile(lead_email: str) -> dict:
+    """{"first_name","last_name","company_name"} from Smartlead, or {}."""
+    if not SMARTLEAD_API_KEY or not lead_email:
+        return {}
+    try:
+        d = requests.get(f"{SMARTLEAD_BASE}/leads/", params={"api_key": SMARTLEAD_API_KEY, "email": lead_email},
+                         timeout=15).json() or {}
+        return {k: (d.get(k) or "").strip() for k in ("first_name", "last_name", "company_name")}
+    except Exception as e:
+        print(f"[smartlead] lead profile failed for {lead_email}: {e}")
+        return {}
+
+
+def _split_name(full: str) -> tuple:
+    parts = (full or "").strip().split()
+    if not parts:
+        return "", ""
+    return parts[0], " ".join(parts[1:])
+
+
+def ensure_person_name(person_id: str, first: str = "", last: str = "", full: str = "") -> bool:
+    """Set the person's name if Attio has none. Never overwrites an existing name."""
+    if not person_id:
+        return False
+    if not (first or last) and full:
+        first, last = _split_name(full)
+    if not (first or last):
+        return False
+    try:
+        vals = _attio("GET", f"/objects/people/records/{person_id}").get("data", {}).get("values", {})
+        if any((n.get("full_name") or "").strip() for n in vals.get("name", [])):
+            return False
+        _attio("PATCH", f"/objects/people/records/{person_id}", json={"data": {"values": {
+            "name": [{"first_name": first, "last_name": last, "full_name": (first + " " + last).strip()}]}}})
+        return True
+    except Exception as e:
+        print(f"[attio] Could not set name on person {person_id}: {e}")
+        return False
+
+
+def ensure_company_name(company_id: str, name: str) -> bool:
+    """Set the company name if Attio has none (Attio usually enriches it from the domain)."""
+    if not company_id or not (name or "").strip():
+        return False
+    try:
+        vals = _attio("GET", f"/objects/companies/records/{company_id}").get("data", {}).get("values", {})
+        if any((n.get("value") or "").strip() for n in vals.get("name", [])):
+            return False
+        _attio("PATCH", f"/objects/companies/records/{company_id}",
+               json={"data": {"values": {"name": [{"value": name.strip()}]}}})
+        return True
+    except Exception as e:
+        print(f"[attio] Could not set name on company {company_id}: {e}")
+        return False
+
+
 def _deal_values(sentiment: str = "", first_mailbox: str = "", mandate: dict = None,
                  first_reply: str = "", campaign_name: str = "") -> dict:
     """Deal fields the bot owns (not stage/name, which are only set on create)."""
@@ -910,7 +966,7 @@ def log_outbound_to_attio(lead_email: str, author: str, text: str, when: str = "
 def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
                   lead_response: str = "", reply_time: str = "", sender: str = "",
                   campaign_id=None, lead_id=None, inbox_link: str = "",
-                  reply_from: str = "") -> dict:
+                  reply_from: str = "", lead_name: str = "") -> dict:
     """
     For EVERY real lead reply: upsert company + person, set Reply status on both,
     create a deal for Positive replies (reused if one exists), then rebuild the
@@ -929,16 +985,26 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         thread = _load_thread(campaign_id, lead_id)
         first_mb = first_outreach_mailbox(thread[1], thread[0] or sender)
 
+        step = "profile"
+        profile = smartlead_lead_profile(lead_email)
+        first, last = profile.get("first_name", ""), profile.get("last_name", "")
+        if not (first or last) and lead_name:
+            first, last = _split_name(lead_name)
+
         step = "company"
         company_id = _record_id(upsert_attio_company(domain, sentiment, first_mb)) if domain else None
         if company_id:
             done.append(f"company ({sentiment})")
+            if ensure_company_name(company_id, profile.get("company_name", "")):
+                done.append("company name")
             if ensure_company_hitch_role(company_id, "Seller"):
                 done.append("role Seller")
 
         step = "person"
         person_id = _record_id(upsert_attio_person(lead_email, sentiment, first_mb))
         done.append(f"person ({sentiment})")
+        if ensure_person_name(person_id, first, last):
+            done.append(f"name {first} {last}".strip())
         if reply_from and _bare_email(reply_from) != lead_email.lower() and not is_own_address(reply_from):
             if ensure_person_email(person_id, reply_from):
                 done.append(f"added email {_bare_email(reply_from)}")
@@ -1322,7 +1388,7 @@ def incoming_reply():
                           lead_response=lead_response, reply_time=reply_time, sender=eaccount,
                           campaign_id=campaign_id, lead_id=lead_id,
                           inbox_link=body.get("ui_master_inbox_link") or body.get("app_url", ""),
-                          reply_from=reply_author)
+                          reply_from=reply_author, lead_name=str(body.get("to_name") or ""))
 
     # Step 4: Claude draft
     # Calendly slot fetching disabled for now:
