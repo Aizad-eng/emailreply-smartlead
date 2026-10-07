@@ -21,7 +21,18 @@ app = Flask(__name__)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ATTIO_API_KEY = os.getenv("ATTIO_API_KEY")        # leave unset to disable the Attio sync
 ATTIO_OWNER_ID = os.getenv("ATTIO_OWNER_ID", "5df13879-f0c5-4967-8982-23a2ca25b8de")  # default: devon@hitch-advisors.com
-ATTIO_DEAL_STAGE = os.getenv("ATTIO_DEAL_STAGE", "Interested")
+ATTIO_DEAL_STAGE = os.getenv("ATTIO_DEAL_STAGE", "Replied")
+ATTIO_DEAL_SOURCE = os.getenv("ATTIO_DEAL_SOURCE", "SmartLead")
+# campaign-name keyword (lowercase substring) -> Attio Mandate record id. Override with env MANDATE_MAP (JSON).
+_DEFAULT_MANDATE_MAP = {
+    "carda": "189f99ad-e497-4ab5-a300-18c586cfb7f7",        # Carda Alliance
+    "pella/marvin": "189f99ad-e497-4ab5-a300-18c586cfb7f7", # Carda Alliance
+    "fenc": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",         # Unified Fencing Group
+}
+try:
+    MANDATE_MAP = {k.lower(): v for k, v in json.loads(os.getenv("MANDATE_MAP", "") or "{}").items()} or _DEFAULT_MANDATE_MAP
+except Exception:
+    MANDATE_MAP = _DEFAULT_MANDATE_MAP
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SMARTLEAD_API_KEY = os.getenv("SMARTLEAD_API_KEY")
@@ -490,13 +501,99 @@ def upsert_attio_person(lead_email: str, sentiment: str = "", first_mailbox: str
                   json={"data": {"values": values}})
 
 
+_mandate_cache = {}
+
+
+def mandate_for_campaign(campaign_name: str) -> dict:
+    """Map a campaign name to {"id", "name", "buyer_id"} or {} if unmapped."""
+    cname = (campaign_name or "").lower()
+    mid = next((v for k, v in MANDATE_MAP.items() if k in cname), None)
+    if not mid:
+        return {}
+    if mid in _mandate_cache:
+        return _mandate_cache[mid]
+    info = {"id": mid, "name": "", "buyer_id": None}
+    try:
+        vals = _attio("GET", f"/objects/mandates/records/{mid}").get("data", {}).get("values", {})
+        names = vals.get("mandate_name") or vals.get("name") or []
+        info["name"] = (names[0].get("value") if names else "") or ""
+        buyers = vals.get("buyer") or []
+        info["buyer_id"] = buyers[0].get("target_record_id") if buyers else None
+    except Exception as e:
+        print(f"[attio] Mandate {mid} lookup failed: {e}")
+    _mandate_cache[mid] = info
+    return info
+
+
+def first_reply_date(messages: list) -> str:
+    """YYYY-MM-DD of the lead's first inbound message, or ''."""
+    for m in messages or []:
+        if m.get("dir") == "inbound" and m.get("time"):
+            iso = _iso(m["time"])
+            return iso[:10] if iso else ""
+    return ""
+
+
+def ensure_company_hitch_role(company_id: str, role: str = "Seller") -> bool:
+    """Add `role` to the company's multi-select hitch_role without dropping others."""
+    if not company_id:
+        return False
+    try:
+        vals = _attio("GET", f"/objects/companies/records/{company_id}").get("data", {}).get("values", {})
+        have = {(v.get("option") or {}).get("title") for v in vals.get("hitch_role", [])}
+        if role in have:
+            return False
+        _attio("PATCH", f"/objects/companies/records/{company_id}",
+               json={"data": {"values": {"hitch_role": [{"option": role}]}}})
+        return True
+    except Exception as e:
+        print(f"[attio] hitch_role update failed for {company_id}: {e}")
+        return False
+
+
+def ensure_person_email(person_id: str, extra_email: str) -> bool:
+    """Append a second address to the person (PATCH appends; Smartlead address stays first)."""
+    extra = _bare_email(extra_email)
+    if not person_id or not extra:
+        return False
+    try:
+        vals = _attio("GET", f"/objects/people/records/{person_id}").get("data", {}).get("values", {})
+        have = {(v.get("email_address") or "").lower() for v in vals.get("email_addresses", [])}
+        if extra in have:
+            return False
+        _attio("PATCH", f"/objects/people/records/{person_id}",
+               json={"data": {"values": {"email_addresses": [{"email_address": extra}]}}})
+        return True
+    except Exception as e:
+        print(f"[attio] Could not add {extra} to person {person_id}: {e}")
+        return False
+
+
+def _deal_values(sentiment: str = "", first_mailbox: str = "", mandate: dict = None,
+                 first_reply: str = "", campaign_name: str = "") -> dict:
+    """Deal fields the bot owns (not stage/name, which are only set on create)."""
+    values = _custom_values(sentiment, first_mailbox)
+    if ATTIO_DEAL_SOURCE:
+        values["source"] = [{"option": ATTIO_DEAL_SOURCE}]
+    if first_reply:
+        values["first_reply_date"] = [{"value": first_reply}]
+    if mandate and mandate.get("id"):
+        values["mandate"] = [{"target_object": "mandates", "target_record_id": mandate["id"]}]
+        if mandate.get("buyer_id"):
+            values["buyer"] = [{"target_object": "companies", "target_record_id": mandate["buyer_id"]}]
+    if campaign_name:
+        values["campaign_old"] = [{"value": campaign_name}]
+    return values
+
+
 def create_attio_deal(lead_email: str, campaign_name: str = "",
                       person_id: str = None, company_id: str = None,
-                      sentiment: str = "", first_mailbox: str = "") -> dict:
+                      sentiment: str = "", first_mailbox: str = "",
+                      mandate: dict = None, first_reply: str = "") -> dict:
     values = {
         "name": [{"value": f"{lead_email} - Interested" + (f" ({campaign_name})" if campaign_name else "")}],
         "stage": [{"status": ATTIO_DEAL_STAGE}],
-        **_custom_values(sentiment, first_mailbox),
+        **_deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name),
     }
     if ATTIO_OWNER_ID:
         values["owner"] = [{"referenced_actor_type": "workspace-member",
@@ -523,9 +620,10 @@ def add_attio_note(parent_object: str, record_id: str, title: str, content: str,
 
 
 def link_attio_deal(deal_id: str, person_id: str = None, company_id: str = None,
-                    sentiment: str = "", first_mailbox: str = "") -> None:
-    """Attach person/company to a deal and refresh its status fields (PATCH)."""
-    values = _custom_values(sentiment, first_mailbox)
+                    sentiment: str = "", first_mailbox: str = "",
+                    mandate: dict = None, first_reply: str = "", campaign_name: str = "") -> None:
+    """Attach person/company to a deal and refresh the bot-owned fields (PATCH; stage untouched)."""
+    values = _deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name)
     if person_id:
         values["associated_people"] = [{"target_object": "people", "target_record_id": person_id}]
     if company_id:
@@ -811,7 +909,8 @@ def log_outbound_to_attio(lead_email: str, author: str, text: str, when: str = "
 
 def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
                   lead_response: str = "", reply_time: str = "", sender: str = "",
-                  campaign_id=None, lead_id=None, inbox_link: str = "") -> dict:
+                  campaign_id=None, lead_id=None, inbox_link: str = "",
+                  reply_from: str = "") -> dict:
     """
     For EVERY real lead reply: upsert company + person, set Reply status on both,
     create a deal for Positive replies (reused if one exists), then rebuild the
@@ -834,10 +933,19 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         company_id = _record_id(upsert_attio_company(domain, sentiment, first_mb)) if domain else None
         if company_id:
             done.append(f"company ({sentiment})")
+            if ensure_company_hitch_role(company_id, "Seller"):
+                done.append("role Seller")
 
         step = "person"
         person_id = _record_id(upsert_attio_person(lead_email, sentiment, first_mb))
         done.append(f"person ({sentiment})")
+        if reply_from and _bare_email(reply_from) != lead_email.lower() and not is_own_address(reply_from):
+            if ensure_person_email(person_id, reply_from):
+                done.append(f"added email {_bare_email(reply_from)}")
+
+        step = "mandate"
+        mandate = mandate_for_campaign(campaign_name)
+        first_reply = first_reply_date(thread[1]) or ((_iso(reply_time) or "")[:10])
 
         deal_id = None
         step = "deal"
@@ -845,14 +953,19 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         if existing:
             deal_id = existing
             try:
-                link_attio_deal(deal_id, person_id, company_id, sentiment, first_mb)
+                link_attio_deal(deal_id, person_id, company_id, sentiment, first_mb,
+                                mandate, first_reply, campaign_name)
             except Exception as e:
                 print(f"[attio] Could not update existing deal {deal_id}: {e}")
             done.append("existing deal")
-        elif sentiment == "Positive":
+        else:
             deal_id = _record_id(create_attio_deal(lead_email, campaign_name, person_id, company_id,
-                                                   sentiment, first_mb))
-            done.append("new deal")
+                                                   sentiment, first_mb, mandate, first_reply))
+            done.append(f"new deal ({ATTIO_DEAL_STAGE})")
+        if mandate.get("id"):
+            done.append(f"mandate {mandate.get('name') or mandate['id'][:8]}")
+        else:
+            done.append("mandate UNMAPPED - ask Dylan")
 
         step = "summary note"
         pending = {"dir": "inbound", "who": lead_email, "time": reply_time, "text": lead_response or "", "kind": ""}
@@ -1208,7 +1321,8 @@ def incoming_reply():
     attio = sync_to_attio(lead_email, sentiment, campaign_name,
                           lead_response=lead_response, reply_time=reply_time, sender=eaccount,
                           campaign_id=campaign_id, lead_id=lead_id,
-                          inbox_link=body.get("ui_master_inbox_link") or body.get("app_url", ""))
+                          inbox_link=body.get("ui_master_inbox_link") or body.get("app_url", ""),
+                          reply_from=reply_author)
 
     # Step 4: Claude draft
     # Calendly slot fetching disabled for now:
@@ -1592,6 +1706,7 @@ def attio_lookup():
             "name": [v.get("full_name") for v in vals.get("name", [])],
             "reply_status": [v.get("option", {}).get("title") for v in vals.get(REPLY_STATUS_SLUG, [])],
             "first_email_sent_from": [v.get("value") for v in vals.get(FIRST_MAILBOX_SLUG, [])],
+            "emails": [v.get("email_address") for v in vals.get("email_addresses", [])],
             "created_at": p.get("created_at"),
         }
         domain = email.split("@", 1)[1]
@@ -1605,6 +1720,7 @@ def attio_lookup():
                     "name": [v.get("value") for v in cv.get("name", [])],
                     "reply_status": [v.get("option", {}).get("title") for v in cv.get(REPLY_STATUS_SLUG, [])],
                     "first_email_sent_from": [v.get("value") for v in cv.get(FIRST_MAILBOX_SLUG, [])],
+                    "hitch_role": [(v.get("option") or {}).get("title") for v in cv.get("hitch_role", [])],
                 }
         except Exception as e:
             out["company_error"] = str(e)[:200]
@@ -1612,11 +1728,20 @@ def attio_lookup():
             q = _attio("POST", "/objects/deals/records/query", json={
                 "filter": {"associated_people": {"target_object": "people", "target_record_id": pid}},
                 "limit": 5})
-            out["deals_linked"] = [{"id": d.get("id", {}).get("record_id"),
-                                    "name": [v.get("value") for v in d.get("values", {}).get("name", [])],
-                                    "reply_status": [v.get("option", {}).get("title") for v in d.get("values", {}).get(REPLY_STATUS_SLUG, [])],
-                                    "first_email_sent_from": [v.get("value") for v in d.get("values", {}).get(FIRST_MAILBOX_SLUG, [])],
-                                    "created_at": d.get("created_at")} for d in q.get("data", [])]
+            def _dv(d):
+                v = d.get("values", {})
+                return {"id": d.get("id", {}).get("record_id"),
+                        "name": [x.get("value") for x in v.get("name", [])],
+                        "stage": [(x.get("status") or {}).get("title") for x in v.get("stage", [])],
+                        "source": [(x.get("option") or {}).get("title") for x in v.get("source", [])],
+                        "first_reply_date": [x.get("value") for x in v.get("first_reply_date", [])],
+                        "mandate": [x.get("target_record_id") for x in v.get("mandate", [])],
+                        "buyer": [x.get("target_record_id") for x in v.get("buyer", [])],
+                        "campaign_old": [x.get("value") for x in v.get("campaign_old", [])],
+                        "reply_status": [(x.get("option") or {}).get("title") for x in v.get(REPLY_STATUS_SLUG, [])],
+                        "first_email_sent_from": [x.get("value") for x in v.get(FIRST_MAILBOX_SLUG, [])],
+                        "created_at": d.get("created_at")}
+            out["deals_linked"] = [_dv(d) for d in q.get("data", [])]
         except requests.HTTPError as e:
             out["deals_linked_error"] = e.response.text[:300] if e.response is not None else str(e)
         try:
@@ -1684,7 +1809,7 @@ def attio_backfill():
         lead_response = latest["text"]
         sentiment = classify_sentiment(lead_response, cname)
         r = sync_to_attio(email, sentiment, cname, lead_response=lead_response, reply_time=latest["time"],
-                          sender=mailbox, campaign_id=cid, lead_id=lead_id)
+                          sender=mailbox, campaign_id=cid, lead_id=lead_id, reply_from=latest.get("who", ""))
         results.append({"campaign": cname, "messages": len(messages), "replies": len(inbound),
                         "latest_sentiment": sentiment, "attio": r["summary"]})
 
@@ -1721,6 +1846,23 @@ def attio_inspect():
         if rid:
             rec = _attio("GET", f"/objects/{obj}/records/{rid}").get("data", {})
             out["record"] = {"id": rec.get("id"), "values": rec.get("values")}
+            return jsonify(out), 200
+        if request.args.get("search"):
+            term = request.args.get("search")
+            comps = _attio("POST", "/objects/companies/records/query",
+                           json={"filter": {"name": {"$contains": term}}, "limit": 10}).get("data", [])
+            found = []
+            for cmp in comps:
+                cid = cmp.get("id", {}).get("record_id")
+                name = [v.get("value") for v in cmp.get("values", {}).get("name", [])]
+                people = _attio("POST", "/objects/people/records/query",
+                                json={"filter": {"company": {"target_object": "companies", "target_record_id": cid}},
+                                      "limit": 10}).get("data", [])
+                found.append({"company_id": cid, "name": name,
+                              "domains": [v.get("domain") for v in cmp.get("values", {}).get("domains", [])],
+                              "people": [[e.get("email_address") for e in p.get("values", {}).get("email_addresses", [])]
+                                         for p in people]})
+            out["companies"] = found
             return jsonify(out), 200
         if obj == "objects":
             out["objects"] = [{"slug": o.get("api_slug"), "singular": o.get("singular_noun")} for o in
