@@ -457,9 +457,13 @@ def _record_id(record: dict):
 FIRST_MAILBOX_SLUG = "first_outreach_mailbox"
 ATTIO_OBJECTS = ("people", "companies", "deals")
 # (slug, title, type, select options)
+FIRST_SENT_SLUG = "first_email_sent_date"
 ATTIO_CUSTOM_ATTRS = (
     (REPLY_STATUS_SLUG, "Reply status", "select", REPLY_STATUS_OPTIONS),
     (FIRST_MAILBOX_SLUG, "First email sent from", "text", None),
+    (FIRST_SENT_SLUG, "First email sent on", "date", None),
+    # deals already have Source (select); people/companies get one too so the channel shows on every record
+    ("source", "Source", "select", ("SmartLead",)),
 )
 REPLY_STATUS_OBJECTS = ATTIO_OBJECTS  # kept for /attio/check
 
@@ -500,23 +504,93 @@ def ensure_reply_status_attribute() -> dict:
     return {"ok": True, "created": created}
 
 
-def _custom_values(sentiment: str = "", first_mailbox: str = "") -> dict:
+def _custom_values(sentiment: str = "", first_mailbox: str = "", first_sent: str = "") -> dict:
     values = {}
     if sentiment in REPLY_STATUS_OPTIONS:
         values[REPLY_STATUS_SLUG] = [{"option": sentiment}]
     if first_mailbox:
         values[FIRST_MAILBOX_SLUG] = [{"value": first_mailbox}]
+    if first_sent:
+        values[FIRST_SENT_SLUG] = [{"value": first_sent}]
     return values
 
 
-def upsert_attio_company(domain: str, sentiment: str = "", first_mailbox: str = "") -> dict:
-    values = {"domains": [{"domain": domain}], **_custom_values(sentiment, first_mailbox)}
+def upsert_attio_company(domain: str, sentiment: str = "", first_mailbox: str = "", first_sent: str = "") -> dict:
+    values = {"domains": [{"domain": domain}], **_custom_values(sentiment, first_mailbox, first_sent)}
     return _attio("PUT", "/objects/companies/records", params={"matching_attribute": "domains"},
                   json={"data": {"values": values}})
 
 
-def upsert_attio_person(lead_email: str, sentiment: str = "", first_mailbox: str = "") -> dict:
-    values = {"email_addresses": [{"email_address": lead_email}], **_custom_values(sentiment, first_mailbox)}
+def ensure_source(obj: str, record_id: str, source: str = "SmartLead") -> bool:
+    """Set Source on a person/company only when it is empty (never overwrite Referral, Inbound, ...)."""
+    if not record_id or not source:
+        return False
+    try:
+        vals = _attio("GET", f"/objects/{obj}/records/{record_id}").get("data", {}).get("values", {})
+        if vals.get("source"):
+            return False
+        _attio("PATCH", f"/objects/{obj}/records/{record_id}",
+               json={"data": {"values": {"source": [{"option": source}]}}})
+        return True
+    except Exception as e:
+        print(f"[attio] Could not set source on {obj} {record_id}: {e}")
+        return False
+
+
+_campaign_cache = {}
+
+
+def campaign_record_for(campaign_id, campaign_name: str = "", mandate: dict = None) -> str:
+    """
+    Attio Campaign record id for a Smartlead campaign: match on Smartlead Campaign ID,
+    then on Campaign Name; create a minimal record (name, Smartlead ID, mandate) if none exists.
+    """
+    cid = str(campaign_id or "").strip()
+    key = cid or (campaign_name or "").strip().lower()
+    if not key:
+        return ""
+    if key in _campaign_cache:
+        return _campaign_cache[key]
+    rid = ""
+    try:
+        if cid:
+            rows = _attio("POST", "/objects/campaigns/records/query",
+                          json={"filter": {"smartlead_campaign_id": cid}, "limit": 1}).get("data", [])
+            rid = rows[0]["id"]["record_id"] if rows else ""
+        if not rid and campaign_name:
+            rows = _attio("POST", "/objects/campaigns/records/query",
+                          json={"filter": {"campaign_name": campaign_name}, "limit": 1}).get("data", [])
+            rid = rows[0]["id"]["record_id"] if rows else ""
+            if rid and cid:
+                _attio("PATCH", f"/objects/campaigns/records/{rid}",
+                       json={"data": {"values": {"smartlead_campaign_id": [{"value": cid}]}}})
+        if not rid and campaign_name:
+            values = {"campaign_name": [{"value": campaign_name}]}
+            if cid:
+                values["smartlead_campaign_id"] = [{"value": cid}]
+            if mandate and mandate.get("id"):
+                values["mandate"] = [{"target_object": "mandates", "target_record_id": mandate["id"]}]
+            rid = _record_id(_attio("POST", "/objects/campaigns/records", json={"data": {"values": values}})) or ""
+            print(f"[attio] Created campaign record {rid} for {campaign_name!r} ({cid})")
+    except Exception as e:
+        print(f"[attio] Campaign lookup failed for {campaign_name!r} ({cid}): {e}")
+        return ""
+    if rid:
+        _campaign_cache[key] = rid
+    return rid
+
+
+def first_sent_date(messages: list) -> str:
+    """YYYY-MM-DD of the first email we sent in the thread, or ''."""
+    for m in messages or []:
+        if m.get("dir") == "outbound" and m.get("time"):
+            iso = _iso(m["time"])
+            return iso[:10] if iso else ""
+    return ""
+
+
+def upsert_attio_person(lead_email: str, sentiment: str = "", first_mailbox: str = "", first_sent: str = "") -> dict:
+    values = {"email_addresses": [{"email_address": lead_email}], **_custom_values(sentiment, first_mailbox, first_sent)}
     return _attio("PUT", "/objects/people/records", params={"matching_attribute": "email_addresses"},
                   json={"data": {"values": values}})
 
@@ -646,9 +720,12 @@ def ensure_company_name(company_id: str, name: str) -> bool:
 
 
 def _deal_values(sentiment: str = "", first_mailbox: str = "", mandate: dict = None,
-                 first_reply: str = "", campaign_name: str = "") -> dict:
+                 first_reply: str = "", campaign_name: str = "", first_sent: str = "",
+                 campaign_rec: str = "") -> dict:
     """Deal fields the bot owns (not stage/name, which are only set on create)."""
-    values = _custom_values(sentiment, first_mailbox)
+    values = _custom_values(sentiment, first_mailbox, first_sent)
+    if campaign_rec:
+        values["campaign"] = [{"target_object": "campaigns", "target_record_id": campaign_rec}]
     if ATTIO_DEAL_SOURCE:
         values["source"] = [{"option": ATTIO_DEAL_SOURCE}]
     if first_reply:
@@ -665,11 +742,12 @@ def _deal_values(sentiment: str = "", first_mailbox: str = "", mandate: dict = N
 def create_attio_deal(lead_email: str, campaign_name: str = "",
                       person_id: str = None, company_id: str = None,
                       sentiment: str = "", first_mailbox: str = "",
-                      mandate: dict = None, first_reply: str = "") -> dict:
+                      mandate: dict = None, first_reply: str = "", first_sent: str = "",
+                      campaign_rec: str = "") -> dict:
     values = {
         "name": [{"value": f"{lead_email} - Interested" + (f" ({campaign_name})" if campaign_name else "")}],
         "stage": [{"status": ATTIO_DEAL_STAGE}],
-        **_deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name),
+        **_deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name, first_sent, campaign_rec),
     }
     if ATTIO_OWNER_ID:
         values["owner"] = [{"referenced_actor_type": "workspace-member",
@@ -697,9 +775,10 @@ def add_attio_note(parent_object: str, record_id: str, title: str, content: str,
 
 def link_attio_deal(deal_id: str, person_id: str = None, company_id: str = None,
                     sentiment: str = "", first_mailbox: str = "",
-                    mandate: dict = None, first_reply: str = "", campaign_name: str = "") -> None:
+                    mandate: dict = None, first_reply: str = "", campaign_name: str = "",
+                    first_sent: str = "", campaign_rec: str = "") -> None:
     """Attach person/company to a deal and refresh the bot-owned fields (PATCH; stage untouched)."""
-    values = _deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name)
+    values = _deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name, first_sent, campaign_rec)
     if person_id:
         values["associated_people"] = [{"target_object": "people", "target_record_id": person_id}]
     if company_id:
@@ -1004,6 +1083,7 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         step = "thread"
         thread = _load_thread(campaign_id, lead_id)
         first_mb = first_outreach_mailbox(thread[1], thread[0] or sender)
+        first_sent = first_sent_date(thread[1])
 
         step = "profile"
         profile = smartlead_lead_profile(lead_email)
@@ -1012,17 +1092,21 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             first, last = _split_name(lead_name)
 
         step = "company"
-        company_id = _record_id(upsert_attio_company(domain, sentiment, first_mb)) if domain else None
+        company_id = _record_id(upsert_attio_company(domain, sentiment, first_mb, first_sent)) if domain else None
         if company_id:
             done.append(f"company ({sentiment})")
+            if ensure_source("companies", company_id, ATTIO_DEAL_SOURCE):
+                done.append("company source")
             if ensure_company_name(company_id, profile.get("company_name", "")):
                 done.append("company name")
             if ensure_company_hitch_role(company_id, "Seller"):
                 done.append("role Seller")
 
         step = "person"
-        person_id = _record_id(upsert_attio_person(lead_email, sentiment, first_mb))
+        person_id = _record_id(upsert_attio_person(lead_email, sentiment, first_mb, first_sent))
         done.append(f"person ({sentiment})")
+        if ensure_source("people", person_id, ATTIO_DEAL_SOURCE):
+            done.append("person source")
         if ensure_person_name(person_id, first, last):
             done.append(f"name {first} {last}".strip())
         if reply_from and _bare_email(reply_from) != lead_email.lower() and not is_own_address(reply_from):
@@ -1033,6 +1117,9 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         mandate = mandate_for_campaign(campaign_name)
         first_reply = first_reply_date(thread[1]) or ((_iso(reply_time) or "")[:10])
 
+        step = "campaign"
+        campaign_rec = campaign_record_for(campaign_id, campaign_name, mandate)
+
         deal_id = None
         step = "deal"
         existing = find_attio_deal_for_person(person_id, lead_email)
@@ -1040,13 +1127,14 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             deal_id = existing
             try:
                 link_attio_deal(deal_id, person_id, company_id, sentiment, first_mb,
-                                mandate, first_reply, campaign_name)
+                                mandate, first_reply, campaign_name, first_sent, campaign_rec)
             except Exception as e:
                 print(f"[attio] Could not update existing deal {deal_id}: {e}")
             done.append("existing deal")
         else:
             deal_id = _record_id(create_attio_deal(lead_email, campaign_name, person_id, company_id,
-                                                   sentiment, first_mb, mandate, first_reply))
+                                                   sentiment, first_mb, mandate, first_reply,
+                                                   first_sent, campaign_rec))
             done.append(f"new deal ({ATTIO_DEAL_STAGE})")
         if mandate.get("id"):
             done.append(f"mandate {mandate.get('name') or mandate['id'][:8]}")
@@ -1058,8 +1146,12 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         res = refresh_conversation(lead_email, campaign_id, lead_id, campaign_name, sentiment,
                                    person_id, deal_id, pending=pending, inbox_link=inbox_link, thread=thread)
         done.append(res)
+        if campaign_rec:
+            done.append(f"campaign {campaign_name}")
         if first_mb:
             done.append(f"first email from {first_mb}")
+        if first_sent:
+            done.append(f"first sent {first_sent}")
 
         summary = "Attio: synced " + " + ".join(done)
         print(f"[attio] {summary} for {lead_email} deal_id={deal_id}")
@@ -1949,6 +2041,15 @@ def attio_inspect():
                               "people": [[e.get("email_address") for e in p.get("values", {}).get("email_addresses", [])]
                                          for p in people]})
             out["companies"] = found
+            return jsonify(out), 200
+        if request.args.get("list"):
+            recs = _attio("POST", f"/objects/{obj}/records/query", json={"limit": 50}).get("data", [])
+            def _v(x):
+                return (x.get("value") or x.get("option", {}).get("title") or x.get("target_record_id")
+                        or x.get("domain") or x.get("email_address") or x.get("full_name"))
+            out["records"] = [{"id": r.get("id", {}).get("record_id"),
+                               **{k: [_v(x) for x in v] for k, v in (r.get("values") or {}).items()
+                                  if v and k not in ("created_by",)}} for r in recs]
             return jsonify(out), 200
         if obj == "objects":
             out["objects"] = [{"slug": o.get("api_slug"), "singular": o.get("singular_noun")} for o in
