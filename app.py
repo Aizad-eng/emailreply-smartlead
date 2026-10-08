@@ -780,13 +780,25 @@ def add_attio_note(parent_object: str, record_id: str, title: str, content: str,
     return _attio("POST", "/notes", json={"data": data})
 
 
+def _bot_named_deal(deal_id: str, lead_email: str) -> bool:
+    """True if the deal still has a name the bot generated ('<email> - ...'). Deals the team
+    renamed by hand (e.g. to the company name) are never renamed by the bot."""
+    try:
+        rec = _attio("GET", f"/objects/deals/records/{deal_id}").get("data", {})
+        name = ((rec.get("values") or {}).get("name") or [{}])[0].get("value") or ""
+    except Exception as e:
+        print(f"[attio] Could not read deal name {deal_id}: {e}")
+        return False
+    return name.lower().startswith(f"{lead_email.lower()} - ")
+
+
 def link_attio_deal(deal_id: str, person_id: str = None, company_id: str = None,
                     sentiment: str = "", first_mailbox: str = "",
                     mandate: dict = None, first_reply: str = "", campaign_name: str = "",
                     first_sent: str = "", campaign_rec: str = "", lead_email: str = "") -> None:
     """Attach person/company to a deal and refresh the bot-owned fields, incl. the name's reply status (PATCH; stage untouched)."""
     values = _deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name, first_sent, campaign_rec)
-    if lead_email and sentiment in REPLY_STATUS_OPTIONS:
+    if lead_email and sentiment in REPLY_STATUS_OPTIONS and _bot_named_deal(deal_id, lead_email):
         values["name"] = [{"value": deal_name(lead_email, sentiment, campaign_name)}]
     if person_id:
         values["associated_people"] = [{"target_object": "people", "target_record_id": person_id}]
