@@ -739,13 +739,20 @@ def _deal_values(sentiment: str = "", first_mailbox: str = "", mandate: dict = N
     return values
 
 
+def deal_name(lead_email: str, sentiment: str = "", campaign_name: str = "") -> str:
+    """'<email> - <latest reply status> (<campaign>)'. Every reply gets a deal now, so the
+    name must follow the reply status instead of always saying 'Interested'."""
+    status = sentiment if sentiment in REPLY_STATUS_OPTIONS else "Replied"
+    return f"{lead_email} - {status}" + (f" ({campaign_name})" if campaign_name else "")
+
+
 def create_attio_deal(lead_email: str, campaign_name: str = "",
                       person_id: str = None, company_id: str = None,
                       sentiment: str = "", first_mailbox: str = "",
                       mandate: dict = None, first_reply: str = "", first_sent: str = "",
                       campaign_rec: str = "") -> dict:
     values = {
-        "name": [{"value": f"{lead_email} - Interested" + (f" ({campaign_name})" if campaign_name else "")}],
+        "name": [{"value": deal_name(lead_email, sentiment, campaign_name)}],
         "stage": [{"status": ATTIO_DEAL_STAGE}],
         **_deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name, first_sent, campaign_rec),
     }
@@ -776,9 +783,11 @@ def add_attio_note(parent_object: str, record_id: str, title: str, content: str,
 def link_attio_deal(deal_id: str, person_id: str = None, company_id: str = None,
                     sentiment: str = "", first_mailbox: str = "",
                     mandate: dict = None, first_reply: str = "", campaign_name: str = "",
-                    first_sent: str = "", campaign_rec: str = "") -> None:
-    """Attach person/company to a deal and refresh the bot-owned fields (PATCH; stage untouched)."""
+                    first_sent: str = "", campaign_rec: str = "", lead_email: str = "") -> None:
+    """Attach person/company to a deal and refresh the bot-owned fields, incl. the name's reply status (PATCH; stage untouched)."""
     values = _deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name, first_sent, campaign_rec)
+    if lead_email and sentiment in REPLY_STATUS_OPTIONS:
+        values["name"] = [{"value": deal_name(lead_email, sentiment, campaign_name)}]
     if person_id:
         values["associated_people"] = [{"target_object": "people", "target_record_id": person_id}]
     if company_id:
@@ -1068,7 +1077,7 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
                   reply_from: str = "", lead_name: str = "") -> dict:
     """
     For EVERY real lead reply: upsert company + person, set Reply status on both,
-    create a deal for Positive replies (reused if one exists), then rebuild the
+    create or reuse a deal for every reply (name carries the latest reply status), then rebuild the
     single living 'Conversation summary' note on the person and deal.
     Never raises -- Attio problems must not block Slack.
     """
@@ -1127,7 +1136,8 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             deal_id = existing
             try:
                 link_attio_deal(deal_id, person_id, company_id, sentiment, first_mb,
-                                mandate, first_reply, campaign_name, first_sent, campaign_rec)
+                                mandate, first_reply, campaign_name, first_sent, campaign_rec,
+                                lead_email=lead_email)
             except Exception as e:
                 print(f"[attio] Could not update existing deal {deal_id}: {e}")
             done.append("existing deal")
