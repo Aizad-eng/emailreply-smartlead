@@ -132,9 +132,26 @@ Here is the full email thread:
         return reply_snippet
 
 
+_AUTO_REPLY_RE = re.compile(
+    r"out of (the )?office|out-of-office|\bOOO\b|auto(matic|mated)?[- ]?(reply|response)|away from (the |my )?(office|desk)"
+    r"|on (vacation|holiday|leave|PTO)|limited access to (my )?e-?mail|(will|I'll|I will) be (out|away|back)|I am (currently )?(out|away)"
+    r"|I'?m (currently )?(out|away) (of|from|until|through|on)|will (be )?return(ing)? on|back in the office|delivery (has )?failed|undeliverable",
+    re.I)
+_INTEREST_RE = re.compile(r"\b(interested|let'?s (talk|chat)|call me|give me a call|sounds good|happy to (talk|chat)|tell me more|set up a (call|time))\b", re.I)
+
+
+def is_auto_reply(text: str) -> bool:
+    """Out-of-office / auto-reply / bounce with no sign of real interest."""
+    t = text or ""
+    return bool(_AUTO_REPLY_RE.search(t)) and not _INTEREST_RE.search(t)
+
+
 def classify_sentiment(lead_response: str, campaign_name: str = "") -> str:
     """Use Claude to label the lead's reply as Positive, Negative, or Neutral."""
     if not lead_response or not lead_response.strip():
+        return "Neutral"
+    if is_auto_reply(lead_response):
+        print("[sentiment] Neutral (auto-reply / out-of-office)")
         return "Neutral"
 
     prompt = f"""You are classifying a reply to a cold outreach email sent by Hitch.
@@ -145,6 +162,7 @@ Classify the lead's reply into exactly one label:
 - Positive: interested, wants to talk, asks for more info, proposes a time, shares a phone number, open to a conversation
 - Negative: not interested, asks to stop/unsubscribe, hostile, already sold, "remove me", wrong person and no referral
 - Neutral: out-of-office, auto-reply, bounce notice, asks a clarifying question with no clear intent, forwards to someone else
+A phone number or alternate contact inside an out-of-office or auto-reply is NOT interest. Label those Neutral.
 
 Reply with ONLY one word: Positive, Negative, or Neutral.
 
