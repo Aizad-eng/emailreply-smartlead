@@ -28,6 +28,8 @@ _DEFAULT_MANDATE_MAP = {
     "carda": "189f99ad-e497-4ab5-a300-18c586cfb7f7",        # Carda Alliance
     "pella/marvin": "189f99ad-e497-4ab5-a300-18c586cfb7f7", # Carda Alliance
     "fenc": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",         # Unified Fencing Group
+    "ufg": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",          # Unified Fencing Group (campaign "UFG GROUP")
+    "unified": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",      # Unified Fencing Group
 }
 try:
     MANDATE_MAP = {k.lower(): v for k, v in json.loads(os.getenv("MANDATE_MAP", "") or "{}").items()} or _DEFAULT_MANDATE_MAP
