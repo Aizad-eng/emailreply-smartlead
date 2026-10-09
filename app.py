@@ -1046,6 +1046,22 @@ def refresh_conversation(lead_email: str, campaign_id, lead_id, campaign_name: s
     return "summary on " + "+".join(targets) if targets else "no target"
 
 
+def _set_status_if_empty(obj: str, record_id: str, status: str) -> bool:
+    """Set Reply status only when the record has none yet (used for auto-replies)."""
+    if not record_id:
+        return False
+    try:
+        vals = _attio("GET", f"/objects/{obj}/records/{record_id}").get("data", {}).get("values", {})
+        if vals.get(REPLY_STATUS_SLUG):
+            return False
+        _attio("PATCH", f"/objects/{obj}/records/{record_id}",
+               json={"data": {"values": {REPLY_STATUS_SLUG: [{"option": status}]}}})
+        return True
+    except Exception as e:
+        print(f"[attio] Could not set status on {obj} {record_id}: {e}")
+        return False
+
+
 def _latest_sentiment(person_id: str) -> str:
     """Read the person's current Reply status so outbound updates keep it."""
     try:
@@ -1090,6 +1106,7 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
     """
     For EVERY real lead reply: upsert company + person, set Reply status on both,
     create or reuse a deal for every reply (name carries the latest reply status), then rebuild the
+    (Out-of-office / auto-replies never create a deal and never overwrite an existing Reply status.)
     single living 'Conversation summary' note on the person and deal.
     Never raises -- Attio problems must not block Slack.
     """
@@ -1098,6 +1115,9 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
 
     domain = lead_email.split("@", 1)[1] if "@" in lead_email else ""
     done, step = [], "custom fields"
+    # Out-of-office / auto-replies: never create a deal, and never overwrite a status set by a real reply
+    auto = is_auto_reply(lead_response)
+    status = "" if auto else sentiment
     try:
         ensure_reply_status_attribute()
 
@@ -1113,9 +1133,12 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             first, last = _split_name(lead_name)
 
         step = "company"
-        company_id = _record_id(upsert_attio_company(domain, sentiment, first_mb, first_sent)) if domain else None
+        company_id = _record_id(upsert_attio_company(domain, status, first_mb, first_sent)) if domain else None
         if company_id:
-            done.append(f"company ({sentiment})")
+            if auto and _set_status_if_empty("companies", company_id, "Neutral"):
+                done.append("company (Neutral, auto-reply)")
+            else:
+                done.append(f"company ({status or 'status kept, auto-reply'})")
             if ensure_source("companies", company_id, ATTIO_DEAL_SOURCE):
                 done.append("company source")
             if ensure_company_name(company_id, profile.get("company_name", "")):
@@ -1124,8 +1147,11 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
                 done.append("role Seller")
 
         step = "person"
-        person_id = _record_id(upsert_attio_person(lead_email, sentiment, first_mb, first_sent))
-        done.append(f"person ({sentiment})")
+        person_id = _record_id(upsert_attio_person(lead_email, status, first_mb, first_sent))
+        if auto and _set_status_if_empty("people", person_id, "Neutral"):
+            done.append("person (Neutral, auto-reply)")
+        else:
+            done.append(f"person ({status or 'status kept, auto-reply'})")
         if ensure_source("people", person_id, ATTIO_DEAL_SOURCE):
             done.append("person source")
         if ensure_person_name(person_id, first, last):
@@ -1147,20 +1173,22 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         if existing:
             deal_id = existing
             try:
-                link_attio_deal(deal_id, person_id, company_id, sentiment, first_mb,
+                link_attio_deal(deal_id, person_id, company_id, status, first_mb,
                                 mandate, first_reply, campaign_name, first_sent, campaign_rec,
                                 lead_email=lead_email)
             except Exception as e:
                 print(f"[attio] Could not update existing deal {deal_id}: {e}")
             done.append("existing deal")
+        elif auto:
+            done.append("no deal (out-of-office / auto-reply)")
         else:
             deal_id = _record_id(create_attio_deal(lead_email, campaign_name, person_id, company_id,
                                                    sentiment, first_mb, mandate, first_reply,
                                                    first_sent, campaign_rec))
             done.append(f"new deal ({ATTIO_DEAL_STAGE})")
-        if mandate.get("id"):
+        if deal_id and mandate.get("id"):
             done.append(f"mandate {mandate.get('name') or mandate['id'][:8]}")
-        else:
+        elif deal_id:
             done.append("mandate UNMAPPED - ask Dylan")
 
         step = "summary note"
@@ -1168,7 +1196,7 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         res = refresh_conversation(lead_email, campaign_id, lead_id, campaign_name, sentiment,
                                    person_id, deal_id, pending=pending, inbox_link=inbox_link, thread=thread)
         done.append(res)
-        if campaign_rec:
+        if campaign_rec and deal_id:
             done.append(f"campaign {campaign_name}")
         if first_mb:
             done.append(f"first email from {first_mb}")
