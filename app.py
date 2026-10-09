@@ -135,8 +135,10 @@ Here is the full email thread:
 _AUTO_REPLY_RE = re.compile(
     r"out of (the )?office|out-of-office|\bOOO\b|auto(matic|mated)?[- ]?(reply|response)|away from (the |my )?(office|desk)"
     r"|on (vacation|holiday|leave|PTO)|limited access to (my )?e-?mail|(will|I'll|I will) be (out|away|back)|I am (currently )?(out|away)"
-    r"|I'?m (currently )?(out|away) (of|from|until|through|on)|will (be )?return(ing)? on|back in the office|delivery (has )?failed|undeliverable",
-    re.I)
+    r"|I'?m (currently )?(out|away) (of|from|until|through|on)|will (be )?return(ing)? on|back in the office|delivery (has )?failed|undeliverable"
+    # canned "thanks for your email, for anything urgent call ..." responders
+    r"|thank you for (your (e-?mail|message)|contacting (us|me))\b.{0,400}?(immediate assistance|if (this|it) is urgent|for urgent|please call|call or text)",
+    re.I | re.S)
 _INTEREST_RE = re.compile(r"\b(interested|let'?s (talk|chat)|call me|give me a call|sounds good|happy to (talk|chat)|tell me more|set up a (call|time))\b", re.I)
 
 
@@ -2060,6 +2062,83 @@ def attio_backfill():
         except Exception as e:
             results.append({"cleanup_error": str(e)[:200]})
     return jsonify({"ok": True, "email": email, "events": results, "old_notes_removed": removed}), 200
+
+
+@app.route("/attio/undo-auto-reply", methods=["GET", "POST"])
+def attio_undo_auto_reply():
+    """
+    Clean up a lead whose only replies are out-of-office / auto-replies:
+    delete the deal the bot made for it (only if it still has the bot's name and is still in
+    the bot's stage, i.e. nobody worked it) and set Reply status back to Neutral.
+    ?email=...            dry run: shows what would change
+    ?email=...&confirm=yes  applies it
+    """
+    if not ATTIO_API_KEY or not SMARTLEAD_API_KEY:
+        return jsonify({"ok": False, "error": "ATTIO_API_KEY / SMARTLEAD_API_KEY not set"}), 200
+    email = _bare_email(request.args.get("email", ""))
+    apply = request.args.get("confirm") == "yes"
+    if not email:
+        return jsonify({"ok": False, "error": "pass ?email=..."}), 200
+    out = {"ok": True, "email": email, "applied": apply, "plan": [], "skipped": []}
+    try:
+        lead = requests.get(f"{SMARTLEAD_BASE}/leads/", params={"api_key": SMARTLEAD_API_KEY, "email": email},
+                            timeout=20).json()
+        lead_id, campaigns = lead.get("id"), lead.get("lead_campaign_data", [])
+        inbound, last_thread = [], None
+        for camp in campaigns:
+            cid, cname = camp.get("campaign_id"), camp.get("campaign_name", "")
+            mailbox, msgs = fetch_thread_messages(cid, lead_id)
+            got = [m for m in msgs if m["dir"] == "inbound"]
+            if got:
+                inbound += got
+                last_thread = (cid, cname, mailbox, msgs)
+        if not inbound:
+            return jsonify({**out, "ok": False, "error": "no replies from this lead in Smartlead"}), 200
+        real = [m["text"][:120] for m in inbound if not is_auto_reply(m["text"])]
+        if real:
+            return jsonify({**out, "ok": False, "error": "lead has real (non auto) replies; not touching it",
+                            "real_replies": real}), 200
+
+        q = _attio("POST", "/objects/people/records/query", json={"filter": {"email_addresses": email}, "limit": 1})
+        rows = q.get("data", [])
+        if not rows:
+            return jsonify({**out, "ok": False, "error": "person not in Attio"}), 200
+        person = rows[0]
+        pid = person["id"]["record_id"]
+        comp = (person.get("values", {}).get("company") or [{}])[0].get("target_record_id")
+        did = find_attio_deal_for_person(pid, email)
+        if did:
+            vals = _attio("GET", f"/objects/deals/records/{did}").get("data", {}).get("values", {})
+            name = ((vals.get("name") or [{}])[0].get("value")) or ""
+            stage = (((vals.get("stage") or [{}])[0].get("status") or {}).get("title")) or ""
+            if _bot_named_deal(did, email) and stage == ATTIO_DEAL_STAGE:
+                out["plan"].append(f"delete deal {did} ({name!r}, stage {stage})")
+                if apply:
+                    _attio("DELETE", f"/objects/deals/records/{did}")
+            else:
+                out["skipped"].append(f"deal {did} kept: name {name!r}, stage {stage!r} (someone worked it)")
+        else:
+            out["skipped"].append("no deal found")
+        for obj, rid in (("people", pid), ("companies", comp)):
+            if not rid:
+                continue
+            cur = (_attio("GET", f"/objects/{obj}/records/{rid}").get("data", {}).get("values", {})
+                   .get(REPLY_STATUS_SLUG) or [{}])[0].get("option", {}) or {}
+            if cur.get("title") != "Neutral":
+                out["plan"].append(f"{obj} reply status {cur.get('title') or 'empty'} -> Neutral")
+                if apply:
+                    _attio("PATCH", f"/objects/{obj}/records/{rid}",
+                           json={"data": {"values": {REPLY_STATUS_SLUG: [{"option": "Neutral"}]}}})
+        if apply and last_thread:
+            cid, cname, mailbox, msgs = last_thread
+            out["plan"].append(refresh_conversation(email, cid, lead_id, cname, "Neutral", pid, None,
+                                                    thread=(mailbox, msgs)))
+    except requests.HTTPError as e:
+        return jsonify({**out, "ok": False, "error": f"{e.response.status_code if e.response is not None else ''} "
+                                                    f"{(e.response.text[:200] if e.response is not None else str(e))}"}), 200
+    except Exception as e:
+        return jsonify({**out, "ok": False, "error": str(e)[:300]}), 200
+    return jsonify(out), 200
 
 
 @app.route("/attio/inspect", methods=["GET"])
