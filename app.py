@@ -1475,6 +1475,21 @@ def _send_from_meta(meta: dict, body: str) -> dict:
 # ROUTE 1: Incoming email reply webhook (from Smartlead, EMAIL_REPLY event)
 # ============================================================
 
+_FREE_MAIL = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com", "msn.com",
+              "live.com", "comcast.net", "att.net", "sbcglobal.net", "verizon.net", "me.com", "ymail.com",
+              "bellsouth.net", "charter.net", "cox.net", "protonmail.com"}
+
+
+def _domain_link(lead_email: str) -> str:
+    """Slack mrkdwn for the lead's email domain: a link to the site, or a note for personal mailboxes."""
+    domain = (lead_email or "").rsplit("@", 1)[-1].strip().lower() if "@" in (lead_email or "") else ""
+    if not domain:
+        return "-"
+    if domain in _FREE_MAIL:
+        return f"{domain} (personal email)"
+    return f"<https://{domain}|{domain}>"
+
+
 @app.route("/webhook/incoming", methods=["POST"])
 def incoming_reply():
     data = request.json or {}
@@ -1611,6 +1626,7 @@ def incoming_reply():
         {"type": "mrkdwn", "text": f"*Campaign*\n{campaign_name or '-'}"},
         {"type": "mrkdwn", "text": f"*Sentiment*\n{sentiment_icon} {sentiment}"},
         {"type": "mrkdwn", "text": f"*Lead*\n{lead_email or '-'}"},
+        {"type": "mrkdwn", "text": f"*Domain*\n{_domain_link(lead_email)}"},
         {"type": "mrkdwn", "text": f"*Sent from*\n{eaccount or '-'}"},
     ]
     if reply_category:
