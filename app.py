@@ -156,13 +156,18 @@ def classify_sentiment(lead_response: str, campaign_name: str = "") -> str:
         print("[sentiment] Neutral (auto-reply / out-of-office)")
         return "Neutral"
 
-    prompt = f"""You are classifying a reply to a cold outreach email sent by Hitch.
+    prompt = f"""You are classifying a reply to a cold outreach email sent by Hitch Advisors, an M&A advisory firm.
+Hitch emails owners of small businesses on behalf of buyers who want to acquire or partner with companies like theirs.
+A lead who is selling, or thinking about selling, is exactly who Hitch wants to talk to.
 
 Campaign: {campaign_name}
 
 Classify the lead's reply into exactly one label:
-- Positive: interested, wants to talk, asks for more info, proposes a time, shares a phone number, open to a conversation
-- Negative: not interested, asks to stop/unsubscribe, hostile, already sold, "remove me", wrong person and no referral
+- Positive: interested, wants to talk, asks for more info, proposes a time, shares a phone number, open to a conversation.
+  ALSO Positive: says they are selling, have decided to sell, plan to sell or retire, are open to offers, are already
+  talking to brokers or other buyers but have not signed or sold yet, or name a price. Talking to brokers is NOT a no.
+- Negative: not interested, not selling, asks to stop/unsubscribe, hostile, "remove me", wrong person and no referral,
+  or the business is ALREADY sold or under contract with someone else
 - Neutral: out-of-office, auto-reply, bounce notice, asks a clarifying question with no clear intent, forwards to someone else
 A phone number or alternate contact inside an out-of-office or auto-reply is NOT interest. Label those Neutral.
 
@@ -2155,6 +2160,15 @@ def attio_undo_auto_reply():
     except Exception as e:
         return jsonify({**out, "ok": False, "error": str(e)[:300]}), 200
     return jsonify(out), 200
+
+
+@app.route("/debug/classify", methods=["POST"])
+def debug_classify():
+    """Read-only: {"texts": [...up to 20]} -> sentiment label per text. Writes nothing anywhere."""
+    texts = (request.json or {}).get("texts") or []
+    if not isinstance(texts, list) or not texts or len(texts) > 20:
+        return jsonify({"ok": False, "error": "send {\"texts\": [1..20 strings]}"}), 200
+    return jsonify({"ok": True, "labels": [classify_sentiment(str(t)[:4000]) for t in texts]}), 200
 
 
 @app.route("/attio/inspect", methods=["GET"])
