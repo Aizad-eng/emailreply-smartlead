@@ -1653,6 +1653,8 @@ def incoming_reply():
         fields.append({"type": "mrkdwn", "text": f"*Angle*\n{lead_vars['angle']}"})
     if lead_vars.get("company_type"):
         fields.append({"type": "mrkdwn", "text": f"*Business type*\n{lead_vars['company_type']}"})
+    if lead_vars.get("review_count"):
+        fields.append({"type": "mrkdwn", "text": f"*Google reviews*\n{lead_vars['review_count']}"})
     if reply_category:
         fields.append({"type": "mrkdwn", "text": f"*Smartlead category*\n{reply_category}"})
 
