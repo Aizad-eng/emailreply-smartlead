@@ -683,6 +683,20 @@ def smartlead_lead_profile(lead_email: str) -> dict:
         return {}
 
 
+def smartlead_lead_vars(lead_email: str) -> dict:
+    """The lead's Smartlead custom variables (angle, company_type, ...), or {}."""
+    if not SMARTLEAD_API_KEY or not lead_email:
+        return {}
+    try:
+        d = requests.get(f"{SMARTLEAD_BASE}/leads/", params={"api_key": SMARTLEAD_API_KEY, "email": lead_email},
+                         timeout=15).json() or {}
+        cf = d.get("custom_fields") or {}
+        return {str(k): str(v).strip() for k, v in cf.items() if v not in (None, "")} if isinstance(cf, dict) else {}
+    except Exception as e:
+        print(f"[smartlead] lead vars failed for {lead_email}: {e}")
+        return {}
+
+
 def _split_name(full: str) -> tuple:
     parts = (full or "").strip().split()
     if not parts:
@@ -1634,6 +1648,11 @@ def incoming_reply():
         {"type": "mrkdwn", "text": f"*Domain*\n{_domain_link(lead_email)}"},
         {"type": "mrkdwn", "text": f"*Sent from*\n{eaccount or '-'}"},
     ]
+    lead_vars = smartlead_lead_vars(lead_email)
+    if lead_vars.get("angle"):
+        fields.append({"type": "mrkdwn", "text": f"*Angle*\n{lead_vars['angle']}"})
+    if lead_vars.get("company_type"):
+        fields.append({"type": "mrkdwn", "text": f"*Business type*\n{lead_vars['company_type']}"})
     if reply_category:
         fields.append({"type": "mrkdwn", "text": f"*Smartlead category*\n{reply_category}"})
 
