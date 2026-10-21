@@ -691,7 +691,10 @@ def smartlead_lead_vars(lead_email: str) -> dict:
         d = requests.get(f"{SMARTLEAD_BASE}/leads/", params={"api_key": SMARTLEAD_API_KEY, "email": lead_email},
                          timeout=15).json() or {}
         cf = d.get("custom_fields") or {}
-        return {str(k): str(v).strip() for k, v in cf.items() if v not in (None, "")} if isinstance(cf, dict) else {}
+        out = {str(k): str(v).strip() for k, v in cf.items() if v not in (None, "")} if isinstance(cf, dict) else {}
+        if not out.get("website") and (d.get("website") or "").strip():
+            out["website"] = d["website"].strip()   # Smartlead's built-in lead field
+        return out
     except Exception as e:
         print(f"[smartlead] lead vars failed for {lead_email}: {e}")
         return {}
@@ -1649,6 +1652,11 @@ def incoming_reply():
         {"type": "mrkdwn", "text": f"*Sent from*\n{eaccount or '-'}"},
     ]
     lead_vars = smartlead_lead_vars(lead_email)
+    if lead_vars.get("website"):
+        site = lead_vars["website"]
+        url = site if site.lower().startswith(("http://", "https://")) else "https://" + site
+        label = re.sub(r"^https?://(www\.)?", "", site, flags=re.I).rstrip("/")
+        fields.append({"type": "mrkdwn", "text": f"*Website*\n<{url}|{label}>"})
     if lead_vars.get("angle"):
         fields.append({"type": "mrkdwn", "text": f"*Angle*\n{lead_vars['angle']}"})
     if lead_vars.get("company_type"):
