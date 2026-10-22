@@ -2263,6 +2263,51 @@ def debug_classify():
     return jsonify({"ok": True, "labels": [classify_sentiment(str(t)[:4000]) for t in texts]}), 200
 
 
+@app.route("/attio/detach-company", methods=["GET", "POST"])
+def attio_detach_company():
+    """
+    Undo a wrong company match on a deal: remove `company` from the deal, and with &delete_company=yes
+    also delete that company, but only if the bot created it (same API actor as the deal) and nothing
+    else is attached to it (no people, no other deals).
+    ?deal=<id>&company=<id>[&delete_company=yes]   dry run; add &confirm=yes to apply
+    """
+    if not ATTIO_API_KEY:
+        return jsonify({"ok": False, "error": "ATTIO_API_KEY not set"}), 200
+    did, cid = request.args.get("deal", ""), request.args.get("company", "")
+    apply = request.args.get("confirm") == "yes"
+    if not did or not cid:
+        return jsonify({"ok": False, "error": "pass ?deal=...&company=..."}), 200
+    out = {"ok": True, "applied": apply, "plan": [], "skipped": []}
+    try:
+        deal = _attio("GET", f"/objects/deals/records/{did}").get("data", {})
+        comp = _attio("GET", f"/objects/companies/records/{cid}").get("data", {})
+        dv, cv = deal.get("values", {}), comp.get("values", {})
+        if cid in [x.get("target_record_id") for x in dv.get("associated_company", [])]:
+            out["plan"].append(f"remove company {cid} from deal {did}")
+            if apply:
+                _attio("PATCH", f"/objects/deals/records/{did}", json={"data": {"values": {"associated_company": []}}})
+        else:
+            out["skipped"].append("deal is not linked to that company")
+        if request.args.get("delete_company") == "yes":
+            actor = lambda v: ((v.get("created_by") or [{}])[0]).get("referenced_actor_id")
+            others = [x.get("target_record_id") for x in cv.get("associated_deals", []) if x.get("target_record_id") != did]
+            people = cv.get("team", [])
+            if actor(cv) != actor(dv) or not actor(cv):
+                out["skipped"].append("company not created by the bot; not deleting")
+            elif others or people:
+                out["skipped"].append(f"company still has {len(others)} other deal(s) and {len(people)} people; not deleting")
+            else:
+                name = ((cv.get("name") or [{}])[0]).get("value")
+                out["plan"].append(f"delete company {cid} ({name!r})")
+                if apply:
+                    _attio("DELETE", f"/objects/companies/records/{cid}")
+    except requests.HTTPError as e:
+        return jsonify({**out, "ok": False, "error": (e.response.text[:300] if e.response is not None else str(e))}), 200
+    except Exception as e:
+        return jsonify({**out, "ok": False, "error": str(e)[:300]}), 200
+    return jsonify(out), 200
+
+
 @app.route("/attio/inspect", methods=["GET"])
 def attio_inspect():
     """Read-only: ?object=deals lists attributes (+ options/statuses); &record=<id> dumps one record."""
