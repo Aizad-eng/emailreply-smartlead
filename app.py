@@ -683,6 +683,44 @@ def smartlead_lead_profile(lead_email: str) -> dict:
         return {}
 
 
+_FREE_MAIL = {
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "rocketmail.com", "aol.com", "aim.com",
+    "hotmail.com", "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "mac.com",
+    "comcast.net", "att.net", "sbcglobal.net", "bellsouth.net", "verizon.net", "charter.net", "cox.net",
+    "earthlink.net", "optonline.net", "frontier.com", "frontiernet.net", "windstream.net", "centurylink.net",
+    "embarqmail.com", "rr.com", "twc.com", "roadrunner.com", "juno.com", "netzero.net", "mail.com",
+    "gmx.com", "protonmail.com", "proton.me", "q.com", "suddenlink.net", "mchsi.com", "zoho.com",
+}
+
+
+def _site_domain(site: str) -> str:
+    """'https://www.Example.com/about' -> 'example.com'"""
+    d = re.sub(r"^[a-z]+://", "", (site or "").strip().lower())
+    d = d.split("/", 1)[0].split("?", 1)[0].split(":", 1)[0]
+    return d[4:] if d.startswith("www.") else d
+
+
+def is_personal_email(email: str) -> bool:
+    return _bare_email(email).rsplit("@", 1)[-1] in _FREE_MAIL if "@" in (email or "") else False
+
+
+def company_domain_for(lead_email: str, lead_vars: dict = None) -> tuple:
+    """
+    (domain, source) for the lead's company. Business address -> its email domain.
+    Personal address (gmail, aol, ...) -> the domain of the lead's Smartlead website, if any.
+    Returns ("", "") when there is no usable company domain.
+    """
+    email = _bare_email(lead_email)
+    dom = email.rsplit("@", 1)[-1] if "@" in email else ""
+    if dom and dom not in _FREE_MAIL:
+        return dom, "email"
+    vars_ = lead_vars if lead_vars is not None else smartlead_lead_vars(email)
+    site = _site_domain(vars_.get("website", ""))
+    if site and "." in site and site not in _FREE_MAIL:
+        return site, "website"
+    return "", ""
+
+
 def smartlead_lead_vars(lead_email: str) -> dict:
     """The lead's Smartlead custom variables (angle, company_type, ...), or {}."""
     if not SMARTLEAD_API_KEY or not lead_email:
@@ -724,6 +762,22 @@ def ensure_person_name(person_id: str, first: str = "", last: str = "", full: st
         return True
     except Exception as e:
         print(f"[attio] Could not set name on person {person_id}: {e}")
+        return False
+
+
+def ensure_person_company(person_id: str, company_id: str) -> bool:
+    """Link the person to the company when Attio could not do it from the email domain (personal email)."""
+    if not person_id or not company_id:
+        return False
+    try:
+        vals = _attio("GET", f"/objects/people/records/{person_id}").get("data", {}).get("values", {})
+        if vals.get("company"):
+            return False
+        _attio("PATCH", f"/objects/people/records/{person_id}",
+               json={"data": {"values": {"company": [{"target_object": "companies", "target_record_id": company_id}]}}})
+        return True
+    except Exception as e:
+        print(f"[attio] Could not link person {person_id} to company {company_id}: {e}")
         return False
 
 
@@ -1137,7 +1191,7 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
     if not ATTIO_API_KEY:
         return {"ok": False, "summary": "Attio: not configured", "deal_id": None}
 
-    domain = lead_email.split("@", 1)[1] if "@" in lead_email else ""
+    domain, domain_src = company_domain_for(lead_email)
     done, step = [], "custom fields"
     # Out-of-office / auto-replies: never create a deal, and never overwrite a status set by a real reply
     auto = is_auto_reply(lead_response)
@@ -1169,6 +1223,10 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
                 done.append("company name")
             if ensure_company_hitch_role(company_id, "Seller"):
                 done.append("role Seller")
+            if domain_src == "website":
+                done.append(f"company from website {domain} (personal email)")
+        elif is_personal_email(lead_email):
+            done.append("no company (personal email, no website)")
 
         step = "person"
         person_id = _record_id(upsert_attio_person(lead_email, status, first_mb, first_sent))
@@ -1178,6 +1236,8 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             done.append(f"person ({status or 'status kept, auto-reply'})")
         if ensure_source("people", person_id, ATTIO_DEAL_SOURCE):
             done.append("person source")
+        if domain_src == "website" and ensure_person_company(person_id, company_id):
+            done.append("person linked to company")
         if ensure_person_name(person_id, first, last):
             done.append(f"name {first} {last}".strip())
         if reply_from and _bare_email(reply_from) != lead_email.lower() and not is_own_address(reply_from):
@@ -1497,18 +1557,14 @@ def _send_from_meta(meta: dict, body: str) -> dict:
 # ROUTE 1: Incoming email reply webhook (from Smartlead, EMAIL_REPLY event)
 # ============================================================
 
-_FREE_MAIL = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com", "msn.com",
-              "live.com", "comcast.net", "att.net", "sbcglobal.net", "verizon.net", "me.com", "ymail.com",
-              "bellsouth.net", "charter.net", "cox.net", "protonmail.com"}
-
-
-def _domain_link(lead_email: str) -> str:
-    """Slack mrkdwn for the lead's email domain: a link to the site, or a note for personal mailboxes."""
-    domain = (lead_email or "").rsplit("@", 1)[-1].strip().lower() if "@" in (lead_email or "") else ""
+def _domain_link(lead_email: str, lead_vars: dict = None) -> str:
+    """Slack mrkdwn for the lead's company domain; for gmail/aol/... it comes from the Smartlead website."""
+    domain, src = company_domain_for(lead_email, lead_vars or {})
     if not domain:
-        return "-"
-    if domain in _FREE_MAIL:
-        return f"{domain} (personal email)"
+        mail = (lead_email or "").rsplit("@", 1)[-1].lower() if "@" in (lead_email or "") else ""
+        return f"{mail} (personal email, no website)" if mail else "-"
+    if src == "website":
+        return f"<https://{domain}|{domain}> (from website, personal email)"
     return f"<https://{domain}|{domain}>"
 
 
@@ -1644,14 +1700,14 @@ def incoming_reply():
     except Exception:
         received_str = ""
 
+    lead_vars = smartlead_lead_vars(lead_email)
     fields = [
         {"type": "mrkdwn", "text": f"*Campaign*\n{campaign_name or '-'}"},
         {"type": "mrkdwn", "text": f"*Sentiment*\n{sentiment_icon} {sentiment}"},
         {"type": "mrkdwn", "text": f"*Lead*\n{lead_email or '-'}"},
-        {"type": "mrkdwn", "text": f"*Domain*\n{_domain_link(lead_email)}"},
+        {"type": "mrkdwn", "text": f"*Domain*\n{_domain_link(lead_email, lead_vars)}"},
         {"type": "mrkdwn", "text": f"*Sent from*\n{eaccount or '-'}"},
     ]
-    lead_vars = smartlead_lead_vars(lead_email)
     if lead_vars.get("website"):
         site = lead_vars["website"]
         url = site if site.lower().startswith(("http://", "https://")) else "https://" + site
