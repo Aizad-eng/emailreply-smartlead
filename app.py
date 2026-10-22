@@ -1195,7 +1195,11 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
     done, step = [], "custom fields"
     # Out-of-office / auto-replies: never create a deal, and never overwrite a status set by a real reply
     auto = is_auto_reply(lead_response)
-    status = "" if auto else sentiment
+    # Neutral (incl. auto-replies) never overwrites a Positive/Negative set by an earlier reply;
+    # it is only written when the record has no status yet. E.g. "Absolutely" then "this is my
+    # business email" must stay Positive.
+    soft = auto or sentiment == "Neutral"
+    status = "" if soft else sentiment
     try:
         ensure_reply_status_attribute()
 
@@ -1213,10 +1217,10 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
         step = "company"
         company_id = _record_id(upsert_attio_company(domain, status, first_mb, first_sent)) if domain else None
         if company_id:
-            if auto and _set_status_if_empty("companies", company_id, "Neutral"):
-                done.append("company (Neutral, auto-reply)")
+            if soft and _set_status_if_empty("companies", company_id, "Neutral"):
+                done.append("company (Neutral)")
             else:
-                done.append(f"company ({status or 'status kept, auto-reply'})")
+                done.append(f"company ({status or 'status kept, neutral reply'})")
             if ensure_source("companies", company_id, ATTIO_DEAL_SOURCE):
                 done.append("company source")
             if ensure_company_name(company_id, profile.get("company_name", "")):
@@ -1230,10 +1234,10 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
 
         step = "person"
         person_id = _record_id(upsert_attio_person(lead_email, status, first_mb, first_sent))
-        if auto and _set_status_if_empty("people", person_id, "Neutral"):
-            done.append("person (Neutral, auto-reply)")
+        if soft and _set_status_if_empty("people", person_id, "Neutral"):
+            done.append("person (Neutral)")
         else:
-            done.append(f"person ({status or 'status kept, auto-reply'})")
+            done.append(f"person ({status or 'status kept, neutral reply'})")
         if ensure_source("people", person_id, ATTIO_DEAL_SOURCE):
             done.append("person source")
         if domain_src == "website" and ensure_person_company(person_id, company_id):
@@ -2142,6 +2146,11 @@ def attio_backfill():
         latest = inbound[-1]
         lead_response = latest["text"]
         sentiment = classify_sentiment(lead_response, cname)
+        if sentiment == "Neutral" and len(inbound) > 1:
+            # a neutral follow-up ("this is my business email") after earlier replies: judge the whole exchange
+            real = [m["text"] for m in inbound if not is_auto_reply(m["text"])]
+            if len(real) > 1:
+                sentiment = classify_sentiment("\n---\n".join(real), cname)
         r = sync_to_attio(email, sentiment, cname, lead_response=lead_response, reply_time=latest["time"],
                           sender=mailbox, campaign_id=cid, lead_id=lead_id, reply_from=latest.get("who", ""))
         results.append({"campaign": cname, "messages": len(messages), "replies": len(inbound),
