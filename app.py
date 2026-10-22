@@ -2308,6 +2308,70 @@ def attio_detach_company():
     return jsonify(out), 200
 
 
+@app.route("/attio/fix-company", methods=["GET", "POST"])
+def attio_fix_company():
+    """
+    Correct a company the bot matched wrongly: rename it, replace or clear its domains, and link a person to it.
+    ?company=<id>&name=<new name>[&domain=<new domain> | &domain=none][&person_email=<email>]
+    Optional deal update: &deal=<id>[&stage=Lost][&lost_reason=...][&fit=...][&fit_notes=...]
+    Dry run by default; add &confirm=yes to apply.
+    """
+    if not ATTIO_API_KEY:
+        return jsonify({"ok": False, "error": "ATTIO_API_KEY not set"}), 200
+    cid = request.args.get("company", "")
+    name = (request.args.get("name") or "").strip()
+    domain = (request.args.get("domain") or "").strip().lower()
+    email = _bare_email(request.args.get("person_email", ""))
+    apply = request.args.get("confirm") == "yes"
+    if not cid:
+        return jsonify({"ok": False, "error": "pass ?company=..."}), 200
+    out = {"ok": True, "applied": apply, "plan": []}
+    try:
+        cv = _attio("GET", f"/objects/companies/records/{cid}").get("data", {}).get("values", {})
+        values = {}
+        if name:
+            out["plan"].append(f"rename {((cv.get('name') or [{}])[0]).get('value')!r} -> {name!r}")
+            values["name"] = [{"value": name}]
+        if domain:
+            old = [d.get("domain") for d in cv.get("domains", [])]
+            new = [] if domain == "none" else [{"domain": domain}]
+            out["plan"].append(f"domains {old} -> {[d['domain'] for d in new]}")
+            values["domains"] = new
+        if values and apply:
+            _attio("PATCH", f"/objects/companies/records/{cid}", json={"data": {"values": values}})
+        if email:
+            rows = _attio("POST", "/objects/people/records/query",
+                          json={"filter": {"email_addresses": email}, "limit": 1}).get("data", [])
+            if rows:
+                pid = rows[0]["id"]["record_id"]
+                out["plan"].append(f"link person {email} to this company")
+                if apply:
+                    _attio("PATCH", f"/objects/people/records/{pid}", json={"data": {"values": {
+                        "company": [{"target_object": "companies", "target_record_id": cid}]}}})
+            else:
+                out["plan"].append(f"person {email} not found; skipped")
+        did = request.args.get("deal", "")
+        if did:
+            dvals = {}
+            if request.args.get("stage"):
+                dvals["stage"] = [{"status": request.args["stage"]}]
+            if request.args.get("lost_reason"):
+                dvals["lost_nurture_reason"] = [{"option": request.args["lost_reason"]}]
+            if request.args.get("fit"):
+                dvals["fit"] = [{"option": request.args["fit"]}]
+            if request.args.get("fit_notes"):
+                dvals["fit_notes"] = [{"value": request.args["fit_notes"]}]
+            if dvals:
+                out["plan"].append(f"deal {did}: " + ", ".join(f"{k}={list(v[0].values())[0]}" for k, v in dvals.items()))
+                if apply:
+                    _attio("PATCH", f"/objects/deals/records/{did}", json={"data": {"values": dvals}})
+    except requests.HTTPError as e:
+        return jsonify({**out, "ok": False, "error": (e.response.text[:300] if e.response is not None else str(e))}), 200
+    except Exception as e:
+        return jsonify({**out, "ok": False, "error": str(e)[:300]}), 200
+    return jsonify(out), 200
+
+
 @app.route("/attio/inspect", methods=["GET"])
 def attio_inspect():
     """Read-only: ?object=deals lists attributes (+ options/statuses); &record=<id> dumps one record."""
