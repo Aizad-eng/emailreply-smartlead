@@ -2338,7 +2338,8 @@ def attio_fix_company():
             out["plan"].append(f"domains {old} -> {[d['domain'] for d in new]}")
             values["domains"] = new
         if values and apply:
-            _attio("PATCH", f"/objects/companies/records/{cid}", json={"data": {"values": values}})
+            # PUT overwrites multi-value fields (domains); PATCH would only append to them
+            _attio("PUT", f"/objects/companies/records/{cid}", json={"data": {"values": values}})
         if email:
             rows = _attio("POST", "/objects/people/records/query",
                           json={"filter": {"email_addresses": email}, "limit": 1}).get("data", [])
