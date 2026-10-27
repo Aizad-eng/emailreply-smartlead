@@ -721,6 +721,25 @@ def company_domain_for(lead_email: str, lead_vars: dict = None) -> tuple:
     return "", ""
 
 
+def smartlead_inbox_url(lead_email: str, campaign_id=None) -> str:
+    """Smartlead master-inbox link for this lead in this campaign (via campaign_lead_map_id), or ''."""
+    if not SMARTLEAD_API_KEY or not lead_email:
+        return ""
+    try:
+        d = requests.get(f"{SMARTLEAD_BASE}/leads/", params={"api_key": SMARTLEAD_API_KEY, "email": lead_email},
+                         timeout=15).json() or {}
+        rows = [r for r in (d.get("lead_campaign_data") or []) if r.get("campaign_lead_map_id")]
+        match = [r for r in rows if str(r.get("campaign_id")) == str(campaign_id)] if campaign_id else []
+        if not match:   # no campaign given or not found: the campaign they last replied in
+            match = sorted(rows, key=lambda r: str(r.get("last_reply_at") or ""), reverse=True)
+        if not match:
+            return ""
+        return f"https://app.smartlead.ai/app/master-inbox?action=INBOX&leadMap={match[0]['campaign_lead_map_id']}"
+    except Exception as e:
+        print(f"[smartlead] inbox url failed for {lead_email}: {e}")
+        return ""
+
+
 def smartlead_lead_vars(lead_email: str) -> dict:
     """The lead's Smartlead custom variables (angle, company_type, ...), or {}."""
     if not SMARTLEAD_API_KEY or not lead_email:
@@ -1242,6 +1261,14 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             done.append("person source")
         if domain_src == "website" and ensure_person_company(person_id, company_id):
             done.append("person linked to company")
+        sl_url = smartlead_inbox_url(lead_email, campaign_id)
+        if sl_url and person_id:
+            try:
+                _attio("PATCH", f"/objects/people/records/{person_id}",
+                       json={"data": {"values": {"smartlead_url": [{"value": sl_url}]}}})
+                done.append("smartlead url")
+            except Exception as e:
+                print(f"[attio] Could not set smartlead_url on {person_id}: {e}")
         if ensure_person_name(person_id, first, last):
             done.append(f"name {first} {last}".strip())
         if reply_from and _bare_email(reply_from) != lead_email.lower() and not is_own_address(reply_from):
