@@ -1261,7 +1261,9 @@ def sync_to_attio(lead_email: str, sentiment: str, campaign_name: str = "",
             done.append("person source")
         if domain_src == "website" and ensure_person_company(person_id, company_id):
             done.append("person linked to company")
-        sl_url = smartlead_inbox_url(lead_email, campaign_id)
+        m_map = re.search(r"leadMap=(\d+)", inbox_link or "")   # the webhook's ui_master_inbox_link already has it
+        sl_url = (f"https://app.smartlead.ai/app/master-inbox?action=INBOX&leadMap={m_map.group(1)}" if m_map
+                  else smartlead_inbox_url(lead_email, campaign_id))
         if sl_url and person_id:
             try:
                 _attio("PATCH", f"/objects/people/records/{person_id}",
