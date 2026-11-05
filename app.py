@@ -88,8 +88,29 @@ def clean_slack_email(email: str) -> str:
     return email
 
 
+_DATA_URI_RE = re.compile(r"data:[a-z]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+", re.I)
+_BLOB_RE = re.compile(r"[A-Za-z0-9+/=]{300,}")
+
+
+def llm_safe(text: str, limit: int = 30000) -> str:
+    """Make email text safe to send to Claude: drop inline images (base64 data URIs), style/script
+    blocks and other long encoded blobs, then cap the length. One reply with an embedded signature
+    logo was ~950k tokens and broke extraction, sentiment and drafting."""
+    if not text:
+        return ""
+    t = re.sub(r"<(style|script)\b.*?</\1>", " ", text, flags=re.S | re.I)
+    t = _DATA_URI_RE.sub("[image]", t)
+    t = _BLOB_RE.sub("[encoded data]", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    if len(t) > limit:
+        t = t[:limit] + "\n[...truncated]"
+    return t
+
+
 def extract_lead_response(reply_text: str, reply_snippet: str, campaign_name: str) -> str:
     """Use Claude to extract the lead's most recent complete response from an email thread."""
+    reply_text = llm_safe(reply_text, 60000)
+    reply_snippet = llm_safe(reply_snippet, 8000)
     if not reply_text:
         return reply_snippet
 
@@ -129,7 +150,7 @@ Here is the full email thread:
         return reply_snippet
     except Exception as e:
         print(f"[extract] Failed to extract lead response: {e}. Falling back to snippet.")
-        return reply_snippet
+        return reply_snippet or llm_safe(_trim_quoted(_strip_html(reply_text)), 8000)
 
 
 _AUTO_REPLY_RE = re.compile(
@@ -993,7 +1014,7 @@ def fetch_thread_messages(campaign_id, lead_id) -> tuple:
     msgs = []
     for m in history:
         who = _bare_email(m.get("from"))
-        text = _trim_quoted(_strip_html(m.get("email_body") or ""))
+        text = llm_safe(_trim_quoted(_strip_html(m.get("email_body") or "")), 8000)
         direction = "outbound" if is_own_address(who) else "inbound"
         kind = "campaign email" if (direction == "outbound" and str(m.get("type", "")).upper() == "SENT"
                                     and not m.get("reply_details") and m.get("email_seq_number")) else ""
@@ -1664,8 +1685,9 @@ def incoming_reply():
         return jsonify({"status": "logged_outbound", "reason": outbound_reason,
                         "author": author, "attio": logged["summary"]}), 200
 
-    # Step 1: Clean lead response for Slack display
-    lead_response = extract_lead_response(reply_html, reply_snippet, campaign_name)
+    # Step 1: Clean lead response for Slack display (never let a huge reply reach Claude)
+    lead_response = llm_safe(extract_lead_response(reply_html, reply_snippet, campaign_name), 8000)
+    sent_text = llm_safe(sent_text, 8000)
 
     # Step 2: Sender name from our mailbox
     sender_name = extract_sender_name(eaccount)
@@ -1689,8 +1711,13 @@ def incoming_reply():
         "ORIGINAL OUTBOUND EMAIL (sent by us):\n" + sent_text +
         "\n\n---\n\nPROSPECT'S REPLY:\n" + lead_response
     )
-    draft = draft_reply(sender_name, eaccount, lead_email, campaign_name, thread_for_claude)
-    draft = scrub_draft(draft)
+    draft_failed = False
+    try:
+        draft = scrub_draft(draft_reply(sender_name, eaccount, lead_email, campaign_name, thread_for_claude))
+    except Exception as e:
+        # a failed draft must never stop the Slack card (and a 500 makes Smartlead retry the webhook)
+        print(f"[draft] Failed for {lead_email}: {e}")
+        draft, draft_failed = "", True
     print(f"[draft] Generated {len(draft)} chars for {lead_email}")
 
     # Step 5: Slack message with action buttons
@@ -1717,7 +1744,7 @@ def incoming_reply():
         meta_edit = json.dumps({**base_meta, "refetch_thread": True})
 
     inbox_link = body.get("ui_master_inbox_link") or body.get("app_url", "")
-    no_response = draft.strip().upper().startswith("NO RESPONSE")
+    no_response = draft_failed or draft.strip().upper().startswith("NO RESPONSE")
 
     sentiment_icon = {"Positive": "\U0001f7e2", "Negative": "\U0001f534"}.get(sentiment, "\u26aa")
 
@@ -1763,7 +1790,10 @@ def incoming_reply():
     if ATTIO_API_KEY:
         context_parts.append(("\u2705 " if attio["ok"] else "\u26a0\ufe0f ") + attio["summary"])
 
-    if no_response:
+    if draft_failed:
+        draft_section = ("*Suggested reply*\n"
+                         "_Couldn't draft a reply automatically. Use *Edit & send* to write one._")
+    elif no_response:
         draft_section = (
             "*Suggested reply*\n"
             "_No reply recommended. The lead declined or asked not to be contacted._\n"
