@@ -1363,7 +1363,11 @@ def send_slack_message(blocks: list) -> dict:
     resp = requests.post(
         SLACK_WEBHOOK_URL,
         json={"blocks": blocks},
+        timeout=20,
     )
+    if resp.status_code >= 400:
+        # Slack explains rejections in the body (invalid_blocks, no_service, channel_is_archived, ...)
+        print(f"[slack] Card rejected: HTTP {resp.status_code} {resp.text[:500]}")
     resp.raise_for_status()
     return resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"ok": True}
 
@@ -2431,6 +2435,20 @@ def attio_fix_company():
     except Exception as e:
         return jsonify({**out, "ok": False, "error": str(e)[:300]}), 200
     return jsonify(out), 200
+
+
+@app.route("/debug/slack-check", methods=["GET"])
+def debug_slack_check():
+    """Read-only: send an EMPTY payload to the Slack incoming webhook. Slack never posts it; a working
+    webhook answers 400 'no_text', a revoked/disconnected one answers e.g. 403/404 'no_service' or 'invalid_token'."""
+    if not SLACK_WEBHOOK_URL:
+        return jsonify({"ok": False, "error": "SLACK_WEBHOOK_URL is not set"}), 200
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL, json={}, timeout=20)
+        return jsonify({"ok": True, "slack_http": r.status_code, "slack_says": r.text[:200],
+                        "webhook_works": r.status_code == 400 and "no_text" in r.text}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 200
 
 
 @app.route("/attio/inspect", methods=["GET"])
