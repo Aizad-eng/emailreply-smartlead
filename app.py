@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 import html as html_lib
 import requests
@@ -1701,11 +1702,13 @@ def incoming_reply():
 
     # Step 3b: Sentiment label for the Slack card
     sentiment = classify_sentiment(lead_response, campaign_name)
-    attio = sync_to_attio(lead_email, sentiment, campaign_name,
-                          lead_response=lead_response, reply_time=reply_time, sender=eaccount,
-                          campaign_id=campaign_id, lead_id=lead_id,
-                          inbox_link=body.get("ui_master_inbox_link") or body.get("app_url", ""),
-                          reply_from=reply_author, lead_name=str(body.get("to_name") or ""))
+    # Attio sync takes ~20s (many API calls + an AI summary). Run it AFTER the Slack card is posted,
+    # in the background: done inline it pushed the request past gunicorn's 30s timeout, the worker
+    # was killed after Attio finished, and the Slack card was never sent.
+    attio_kwargs = dict(lead_response=lead_response, reply_time=reply_time, sender=eaccount,
+                        campaign_id=campaign_id, lead_id=lead_id,
+                        inbox_link=body.get("ui_master_inbox_link") or body.get("app_url", ""),
+                        reply_from=reply_author, lead_name=str(body.get("to_name") or ""))
 
     # Step 4: Claude draft
     # Calendly slot fetching disabled for now:
@@ -1793,7 +1796,7 @@ def incoming_reply():
     if subject:
         context_parts.append(f"Subject: {subject}")
     if ATTIO_API_KEY:
-        context_parts.append(("\u2705 " if attio["ok"] else "\u26a0\ufe0f ") + attio["summary"])
+        context_parts.append("Attio: syncing in the background")
 
     if draft_failed:
         draft_section = ("*Suggested reply*\n"
@@ -1844,8 +1847,23 @@ def incoming_reply():
         {"type": "actions", "elements": buttons},
     ]
 
-    send_slack_message(blocks)
+    slack_error = ""
+    try:
+        send_slack_message(blocks)
+    except Exception as e:
+        slack_error = str(e)[:200]
+        print(f"[slack] Could not post card for {lead_email}: {e}")
 
+    def _attio_bg():
+        try:
+            sync_to_attio(lead_email, sentiment, campaign_name, **attio_kwargs)
+        except Exception as e:
+            print(f"[attio] Background sync failed for {lead_email}: {e}")
+    if ATTIO_API_KEY:
+        threading.Thread(target=_attio_bg, daemon=True).start()
+
+    if slack_error:
+        return jsonify({"status": "slack_failed", "error": slack_error, "stats_id": stats_id}), 200
     return jsonify({"status": "posted_to_slack", "stats_id": stats_id}), 200
 
 
