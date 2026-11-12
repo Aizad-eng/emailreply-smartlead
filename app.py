@@ -1369,7 +1369,7 @@ def send_slack_message(blocks: list) -> dict:
     if resp.status_code >= 400:
         # Slack explains rejections in the body (invalid_blocks, no_service, channel_is_archived, ...)
         print(f"[slack] Card rejected: HTTP {resp.status_code} {resp.text[:500]}")
-    resp.raise_for_status()
+        raise RuntimeError(f"Slack HTTP {resp.status_code}: {resp.text[:300]}")
     return resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"ok": True}
 
 
@@ -1413,13 +1413,42 @@ def _bare_email(value) -> str:
     return m.group(0).lower() if m else ""
 
 
+_own_domains_cache = {"at": 0.0, "domains": set()}
+
+
+def own_sending_domains() -> set:
+    """Domains of every Smartlead email account (our mailboxes), refreshed hourly. New sending domains
+    like wilderadvisorio.com don't contain 'hitch', so the keyword check alone treated replies sent to
+    them as our own outbound emails and posted no Slack card."""
+    now = time.time()
+    if SMARTLEAD_API_KEY and now - _own_domains_cache["at"] > 3600:
+        domains, offset = set(), 0
+        try:
+            while True:
+                page = requests.get(f"{SMARTLEAD_BASE}/email-accounts/", timeout=20,
+                                    params={"api_key": SMARTLEAD_API_KEY, "offset": offset, "limit": 100}).json()
+                if not isinstance(page, list) or not page:
+                    break
+                domains |= {_bare_email(a.get("from_email")).rsplit("@", 1)[-1] for a in page if a.get("from_email")}
+                if len(page) < 100:
+                    break
+                offset += 100
+            if domains:
+                _own_domains_cache.update(at=now, domains=domains)
+                print(f"[own] {len(domains)} sending domains loaded from Smartlead")
+        except Exception as e:
+            print(f"[own] Could not load Smartlead sending domains: {e}")
+            _own_domains_cache["at"] = now - 3000   # retry in ~10 min
+    return _own_domains_cache["domains"]
+
+
 def is_own_address(value) -> bool:
-    """True if the address belongs to one of our own sending domains."""
+    """True if the address is one of our mailboxes: any Smartlead sending domain, or a 'hitch' domain."""
     email = _bare_email(value)
     if "@" not in email:
         return False
     domain = email.split("@", 1)[1]
-    return any(k in domain for k in OWN_DOMAIN_KEYWORDS)
+    return any(k in domain for k in OWN_DOMAIN_KEYWORDS) or domain in own_sending_domains()
 
 
 def find_reply_author(body: dict, campaign_id, lead_id, message_id: str) -> str:
@@ -1859,7 +1888,7 @@ def incoming_reply():
             sync_to_attio(lead_email, sentiment, campaign_name, **attio_kwargs)
         except Exception as e:
             print(f"[attio] Background sync failed for {lead_email}: {e}")
-    if ATTIO_API_KEY:
+    if ATTIO_API_KEY and not body.get("_skip_attio"):
         threading.Thread(target=_attio_bg, daemon=True).start()
 
     if slack_error:
@@ -2467,6 +2496,52 @@ def debug_slack_check():
                         "webhook_works": r.status_code == 400 and "no_text" in r.text}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:200]}), 200
+
+
+@app.route("/debug/replay-card", methods=["GET", "POST"])
+def debug_replay_card():
+    """
+    Rebuild the Slack card for a lead's latest reply from Smartlead and post it (Attio is not touched).
+    Used to re-send cards that never reached Slack, and to see Slack's exact error if it refuses one.
+    ?email=...  dry run;  &confirm=yes  posts the card.
+    """
+    email = _bare_email(request.args.get("email", ""))
+    if not email or not SMARTLEAD_API_KEY:
+        return jsonify({"ok": False, "error": "pass ?email=... (and SMARTLEAD_API_KEY must be set)"}), 200
+    try:
+        lead = requests.get(f"{SMARTLEAD_BASE}/leads/", params={"api_key": SMARTLEAD_API_KEY, "email": email}, timeout=20).json() or {}
+        camps = [c for c in lead.get("lead_campaign_data", []) if c.get("last_reply_at")]
+        if not camps:
+            return jsonify({"ok": False, "error": "no reply from this lead in Smartlead"}), 200
+        camp = sorted(camps, key=lambda c: str(c["last_reply_at"]))[-1]
+        hist = requests.get(f"{SMARTLEAD_BASE}/campaigns/{camp['campaign_id']}/leads/{lead['id']}/message-history",
+                            params={"api_key": SMARTLEAD_API_KEY}, timeout=20).json().get("history", [])
+        replies = [m for m in hist if str(m.get("type")).upper() == "REPLY"]
+        if not replies:
+            return jsonify({"ok": False, "error": "no REPLY in message history"}), 200
+        r = replies[-1]
+        sents = [m for m in hist if str(m.get("type")).upper() == "SENT" and str(m.get("time", "")) <= str(r.get("time", ""))]
+        s = sents[-1] if sents else {}
+        body = {
+            "event_type": "EMAIL_REPLY", "campaign_id": camp["campaign_id"], "campaign_name": camp.get("campaign_name", ""),
+            "stats_id": r.get("stats_id") or s.get("stats_id"), "sl_email_lead_id": lead["id"], "sl_lead_email": email,
+            "from_email": _bare_email(s.get("from") or r.get("to") or ""), "subject": s.get("subject") or "Re:",
+            "message_id": r.get("message_id", ""), "time_replied": r.get("time", ""),
+            "reply_message": {"html": r.get("email_body", ""), "message_id": r.get("message_id", ""), "time": r.get("time", "")},
+            "sent_message": {"html": s.get("email_body", "")},
+            "ui_master_inbox_link": f"https://app.smartlead.ai/app/master-inbox?leadMap={camp.get('campaign_lead_map_id')}",
+            "to_name": f"{lead.get('first_name') or ''} {lead.get('last_name') or ''}".strip(),
+            "_skip_attio": True,
+        }
+        summary = {k: body[k] for k in ("campaign_name", "stats_id", "from_email", "time_replied")}
+        if request.args.get("confirm") != "yes":
+            return jsonify({"ok": True, "dry_run": True, "would_post": summary}), 200
+        with app.test_request_context("/webhook/incoming", method="POST", json=body):
+            res = incoming_reply()
+        resp, code = res if isinstance(res, tuple) else (res, 200)
+        return jsonify({"ok": True, "replayed": summary, "result": resp.get_json(), "http": code}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:400]}), 200
 
 
 @app.route("/attio/inspect", methods=["GET"])
