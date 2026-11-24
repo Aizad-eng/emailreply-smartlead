@@ -31,7 +31,8 @@ _DEFAULT_MANDATE_MAP = {
     "fenc": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",         # Unified Fencing Group
     "ufg": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",          # Unified Fencing Group (campaign "UFG GROUP")
     "unified": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",      # Unified Fencing Group
-    "alpine": "681c5616-44c2-4ea6-90f6-0d57a339a8a2",       # Alpine - Forge Paving (all Alpine paving campaigns)
+    "alpine paving": "681c5616-44c2-4ea6-90f6-0d57a339a8a2",  # Alpine - Forge Paving (Alpine PAVING campaigns only;
+                                                              # other Alpine campaigns, e.g. windows & doors, get none)
 }
 try:
     MANDATE_MAP = {k.lower(): v for k, v in json.loads(os.getenv("MANDATE_MAP", "") or "{}").items()} or _DEFAULT_MANDATE_MAP
@@ -918,6 +919,18 @@ def link_attio_deal(deal_id: str, person_id: str = None, company_id: str = None,
                     first_sent: str = "", campaign_rec: str = "", lead_email: str = "") -> None:
     """Attach person/company to a deal and refresh the bot-owned fields, incl. the name's reply status (PATCH; stage untouched)."""
     values = _deal_values(sentiment, first_mailbox, mandate, first_reply, campaign_name, first_sent, campaign_rec)
+    if "mandate" in values or "buyer" in values:
+        # the team sets mandates by hand: only fill Mandate/Buyer when the deal has none yet
+        try:
+            cur = _attio("GET", f"/objects/deals/records/{deal_id}").get("data", {}).get("values", {})
+            if cur.get("mandate"):
+                values.pop("mandate", None)
+            if cur.get("buyer"):
+                values.pop("buyer", None)
+        except Exception as e:
+            print(f"[attio] Could not read deal {deal_id} before mandate update; leaving mandate/buyer alone: {e}")
+            values.pop("mandate", None)
+            values.pop("buyer", None)
     if lead_email and sentiment in REPLY_STATUS_OPTIONS and _bot_named_deal(deal_id, lead_email):
         values["name"] = [{"value": deal_name(lead_email, sentiment, campaign_name)}]
     if person_id:
@@ -1884,10 +1897,17 @@ def incoming_reply():
         print(f"[slack] Could not post card for {lead_email}: {e}")
 
     def _attio_bg():
-        try:
-            sync_to_attio(lead_email, sentiment, campaign_name, **attio_kwargs)
-        except Exception as e:
-            print(f"[attio] Background sync failed for {lead_email}: {e}")
+        # Attio occasionally returns a one-off 500 (e.g. "unexpected error when upserting the record");
+        # every step is an upsert or a lookup, so running the whole sync again is safe.
+        for attempt in range(3):
+            try:
+                res = sync_to_attio(lead_email, sentiment, campaign_name, **attio_kwargs)
+                if res.get("ok"):
+                    return
+                print(f"[attio] Background sync attempt {attempt + 1} failed for {lead_email}: {res.get('summary')}")
+            except Exception as e:
+                print(f"[attio] Background sync attempt {attempt + 1} crashed for {lead_email}: {e}")
+            time.sleep(10 * (attempt + 1))
     if ATTIO_API_KEY and not body.get("_skip_attio"):
         threading.Thread(target=_attio_bg, daemon=True).start()
 
