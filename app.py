@@ -31,8 +31,8 @@ _DEFAULT_MANDATE_MAP = {
     "fenc": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",         # Unified Fencing Group
     "ufg": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",          # Unified Fencing Group (campaign "UFG GROUP")
     "unified": "64527d31-d1fa-4d3b-bf60-526ef9c63e04",      # Unified Fencing Group
-    "alpine paving": "681c5616-44c2-4ea6-90f6-0d57a339a8a2",  # Alpine - Forge Paving (Alpine PAVING campaigns only;
-                                                              # other Alpine campaigns, e.g. windows & doors, get none)
+    "alpine paving": "681c5616-44c2-4ea6-90f6-0d57a339a8a2",  # Alpine - Forge Paving (Alpine PAVING campaigns only)
+    "alpine window": "eea8e48a-e5b7-4bf5-a578-7b34f1ee3918",  # Alpine - Mosaic (Alpine Windows and doors campaigns)
 }
 try:
     MANDATE_MAP = {k.lower(): v for k, v in json.loads(os.getenv("MANDATE_MAP", "") or "{}").items()} or _DEFAULT_MANDATE_MAP
